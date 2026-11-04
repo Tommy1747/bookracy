@@ -14,7 +14,7 @@ The frontend consumes `bookracy-convertor` locally via `file:../epub-converter`.
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) (v20 or higher recommended, tested on v22)
+- [Node.js](https://nodejs.org/) (v22 or higher required; e.g. `wrangler`, `miniflare`, and `@cloudflare/kv-asset-handler` require Node >= 22.0.0)
 - [pnpm](https://pnpm.io/) (v10 or higher recommended)
 
 ## Dependency Installation
