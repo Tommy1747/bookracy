@@ -2,38 +2,36 @@
 
 ## 1. Executive Summary
 
-Bookracy is a universal personal reading and book discovery platform. It provides users with multi-source book search, metadata enrichment, direct and proxied downloading, local browser-based offline storage, an in-browser EPUB reader, an EPUB-to-PDF conversion engine, community-driven uploads, and multi-device cloud synchronization.
+Bookracy is a universal personal reading and book discovery platform designed to aggregate external book repositories, provide offline reading in the browser, convert EPUB documents to PDF, and support community uploads with multi-device cloud synchronization.
 
-This audit evaluates the entire Bookracy codebase—comprising the Cloudflare Worker backend (`backend-worker`), the client-side EPUB-to-PDF conversion library (`epub-converter`), and the React 19/TanStack single-page application (`frontend`).
+This audit evaluates the entire Bookracy codebase—comprising the Cloudflare Worker backend (`backend-worker`), the client-side EPUB-to-PDF conversion library (`epub-converter`), and the React 19 single-page application (`frontend`).
 
 ### Key Findings
-1. **Strong Foundational Architecture**: The application demonstrates thoughtful distributed systems engineering. The backend incorporates multi-mirror failover (Library Genesis, Anna's Archive, Standard Ebooks), SQLite/D1 full-text search fallback (`search_index_fts`), edge caching via Cloudflare R2 and KV, and a durable Telegram/Discord chunked backup queue.
-2. **Specialized E-Reader Focus**: The built-in reader is currently restricted strictly to EPUB files via `epubjs`. Format support for PDF, CBZ/CBR, MOBI, and plain text documents does not have in-app reading capabilities (PDFs currently delegate to standard browser new-tab viewing).
-3. **Library and Power-User Constraints**: The offline library relies on browser IndexedDB, persisting book blobs and metadata locally. However, advanced library management features (nested collections, tagging, full-text document search, multi-format reading progress, bulk batch metadata editing) are missing or rudimentary.
-4. **Resilience and Stability Gaps**: Upstream scrapers are inherently fragile against upstream HTML changes, CAPTCHAs, and mirror IP bans. While the backend implements backoff and deduplication, frontend client handling of transient upstream errors requires more informative state signaling.
-5. **Monorepo Dependency Linkage**: `epub-converter` is consumed as a local `file:../epub-converter` dependency in `frontend/package.json`. If `epub-converter` is not built prior to frontend typecheck/build, TypeScript compilation fails due to missing declarations.
-
-The accompanying roadmap outlines a phased evolution from core reliability (P0) to unified reading experiences (P1), personal library management (P2), advanced comic/manga/document workflows (P3), AI assistance (P4), and community features (P5).
+1. **Multi-Tiered Backend Architecture [Verified]**: The backend (`backend-worker/src/index.ts`) implements resilient failover across multiple book sources (Library Genesis 5-mirror racing, Anna's Archive scraping, Standard Ebooks OPDS). A local SQLite/D1 database (`search_index_fts`) provides diacritic-insensitive FTS5 fallback when external providers fail. Downloaded files are cached in Cloudflare R2 and replicated via Cloudflare Queues into Telegram and Discord chunked backup storage (`backend-worker/src/storage/backup.ts`).
+2. **EPUB-Centric Reading Experience [Verified]**: The in-app reader (`frontend/src/components/epub-reader/epub-reader.tsx`) uses `epubjs` and is strictly limited to EPUB files. Other formats (PDF, CBZ, CBR, TXT) have no in-app reading viewer; PDFs are opened in a browser new tab via `<OpenPdfButton>` (`frontend/src/components/books/open-pdf-button.tsx`).
+3. **IndexedDB Offline Storage [Verified]**: The offline library (`frontend/src/lib/offline-books.ts`) stores book binary blobs and metadata records in browser IndexedDB (`bookracy-offline` v2). However, personal library organization lacks nested folders, tagging, full-text document search, and reading status tracking (Want to Read / Currently Reading / Finished).
+4. **Security & Authentication Model [Verified]**: User sync accounts rely on a 64-character hex bearer token (`backend-worker/src/index.ts:genAccountId`). Accounts contain no email or password. Metadata blobs are stored unencrypted in Cloudflare KV (`SYNC` namespace); the backend does not provide zero-knowledge end-to-end encryption. Community uploads enforce server-side streaming MD5 checks and container magic-byte verification, but do not execute deep archive inspection (ZIP bomb detection) or antivirus scanning.
+5. **Monorepo Build Coupling [Verified]**: `frontend/package.json` depends on `bookracy-convertor` via `file:../epub-converter`. Running `pnpm build` in `frontend` without first running `pnpm build` in `epub-converter` causes TypeScript compilation failures due to missing module declarations.
 
 ---
 
 ## 2. Existing Architecture
 
-The repository is structured into three decoupled subprojects without a root `package.json`:
+The repository is structured into three subprojects without a root workspace configuration:
 
 ```
 bookracy/
 ├── backend-worker/     # Cloudflare Worker API & Edge Proxy
 │   ├── src/            # Routing, scrapers, rate limiting, backups, search index
 │   ├── migrations/     # Cloudflare D1 SQL schemas (community, moderation, FTS)
-│   ├── scripts/        # Awards data builder and live provider tests
-│   └── tests/          # Node.js built-in test runner test suite
-├── epub-converter/     # EPUB-to-PDF client conversion library
+│   ├── scripts/        # Awards dataset builder and live provider tests
+│   └── tests/          # Node.js built-in test runner test suite (148 tests)
+├── epub-converter/     # Client-side EPUB-to-PDF conversion library
 │   ├── src/            # jsPDF, JSZip, CSS/XML parsing, layout engine
-│   └── tests/          # Node.js test runner unit tests with tsx
+│   └── tests/          # Node.js test runner unit tests with tsx (18 tests)
 └── frontend/           # Modern React SPA
     ├── src/
-    │   ├── api/        # TanStack Query options & fetchers
+    │   ├── api/        # TanStack Query options & ofetch client
     │   ├── components/ # Radix UI, Lucide icons, reader, bookshelf, community
     │   ├── hooks/      # SEO, reading pace, speech, layout
     │   ├── lib/        # IndexedDB offline store, sync engine, web worker
@@ -43,440 +41,553 @@ bookracy/
     └── public/         # Manifest, icons, sitemaps, Noto Sans TTF fallback fonts
 ```
 
-### Backend Architecture (`backend-worker`)
-- **Runtime**: Cloudflare Workers (compatibility date `2026-06-21`, `workerd`).
-- **Storage & Caching**:
-  - Cloudflare R2 bucket (`bookracy-books`) for caching downloaded books and book covers.
-  - Cloudflare KV (`SYNC` for user account metadata blobs; `BACKUPS` for chunked storage manifests; Cache API for Apple JWTs).
-  - Cloudflare D1 (`bookracy-meta` SQLite database) with tables: `users`, `uploads`, `search_index`, and `search_index_fts`.
-  - Cloudflare Queues (`book-backup` producer/consumer and `book-backup-dlq` consumer) managing chunked replication into Telegram channels and Discord storage channels.
-- **Upstream Integrations & Aggregation**:
-  - Anna's Archive (search scraper and slow-partner download link parser).
-  - Library Genesis (5 mirror rotators with transient retry logic and ads/get link resolution).
-  - Apple Books Catalog (amp-api tokenized catalog search, marketing RSS feed, and autocomplete hints).
-  - Standard Ebooks (OPDS/Atom feed parsing with direct epub/kepub downloads).
-  - The Greatest Books & Five Books (curated recommendation feeds and reading orders).
-- **Edge Protections**: Custom domain routing (`api.bookracy.com`), per-IP Cloudflare Rate Limiters (`RATE_LIMITER`, `ACCOUNT_CREATE_LIMITER`, `COVER_LIMITER`, `SEARCH_LIMITER`, `UPLOAD_LIMITER`, `METADATA_LIMITER`, `MD5_LIMITER`).
+### Architectural Evidence & Verification Table
 
-### Conversion Engine (`epub-converter`)
-- **Core Technology**: `jspdf`, `jszip`, `@xmldom/xmldom`, `css-tree`, `html-to-text`.
-- **Key Capabilities**: Converts EPUB archives into readable PDF documents client-side. Handles Flate compression, font sniffing (TTF/OTF vs WOFF), inline styling extraction, multi-word layout wrapping, table of contents outline mapping, and fallback font rendering using Noto Sans for non-Latin characters.
-- **Execution**: Can run in the main browser thread or offloaded to a Web Worker (`frontend/src/lib/epub-to-pdf.worker.ts`).
-
-### Frontend Architecture (`frontend`)
-- **Framework**: React 19, Vite 6, TypeScript 5.9, Tailwind CSS v4 with Radix UI primitives.
-- **Routing & State**: TanStack Router with code splitting, TanStack Query v5 for server state caching and deduplication, Zustand v5 with local storage persistence for client state (bookmarks, reader appearance, download queue, offline library metadata).
-- **Offline & Persistence**: IndexedDB database (`bookracy-offline` v2) separating metadata records from binary book blobs (`blobs` store). PWA service worker caching static assets.
-- **Kindle Integration**: Generates shell script installers (`/kindle/install.sh` and `/kindle/bookracy.sh`) allowing jailbroken Kindle e-ink devices to query the API and download books directly.
+| Component | Repository Path / Evidence | Verification Status | Architectural & Product Impact |
+| :--- | :--- | :--- | :--- |
+| **Worker Routing & Limiting** | `backend-worker/src/index.ts`, `backend-worker/wrangler.toml` | **Verified** | Enforces 7 rate-limiting namespaces (`SEARCH`, `MD5`, `METADATA`, `COVER`, `ACCOUNT_CREATE`, `UPLOAD`, `RATE_LIMITER`). Disables `workers.dev` to require custom domain edge protections. |
+| **Multi-Provider Search** | `backend-worker/src/index.ts` (`searchSources`), `backend-worker/src/parse.ts` | **Verified** | Scrapes Anna's Archive; falls back to Library Genesis 5-mirror racing; falls back to D1 FTS5 (`search_index_fts`); falls back to Standard Ebooks / Open Library. |
+| **D1 Database Schema** | `backend-worker/migrations/0001` - `0004` | **Verified** | Tables: `users`, `uploads`, `search_index`, `search_index_fts` (FTS5 external content table with unicode61 diacritic folding). |
+| **Chunked Backup Queue** | `backend-worker/src/storage/backup.ts`, `backend-worker/src/resumable.ts` | **Verified** | Consumer pipes R2 files into 10 MB chunks across Telegram and Discord storage; DLQ consumer writes permanent failures to `backup-failed:{md5}` ledger. |
+| **Client EPUB Engine** | `frontend/src/components/epub-reader/epub-reader.tsx`, `epub-view.tsx` | **Verified** | Wraps `epubjs`; supports custom font size, font family, line height, themes (Light, Sepia, Dark, Slate), TOC sheet, and reading pace estimation. |
+| **IndexedDB Offline Store** | `frontend/src/lib/offline-books.ts` | **Verified** | Database `bookracy-offline` (v2) stores metadata in `books` object store and binary payloads in `blobs` object store. Calls `navigator.storage.persist()`. |
+| **EPUB to PDF Converter** | `epub-converter/src/buildPdf.ts`, `frontend/src/lib/epub-to-pdf.worker.ts` | **Verified** | Flate compression, font sniffing (TTF/OTF vs WOFF), outline bookmarks, Noto Sans fallback for non-Latin glyphs. Executed inside Web Worker. |
+| **Cloud Sync Client** | `frontend/src/lib/sync/cloud.ts`, `frontend/src/stores/sync.ts` | **Verified** | Merges bookmarks, folders, reading progress, and settings to `/api/account` using 64-hex bearer key; unencrypted JSON payload in KV. |
 
 ---
 
 ## 3. Current Feature Inventory
 
-| Functional Area | Feature / Capability | Implementation Status | Quality / Verification Notes |
-| :--- | :--- | :--- | :--- |
-| **Discovery & Search** | Keyword Search (Title/Author) | **Implemented & Working** | Aggregates AA, LibGen, Standard Ebooks; handles diacritics via SQLite FTS5 fallback. |
-| | ISBN Search | **Implemented & Working** | Queries LibGen and Apple Books metadata endpoints. |
-| | Search Autocomplete / Suggestions | **Implemented & Working** | Apple Books `MZSearchHints` proxy with debounce. |
-| | Source & Format Filtering | **Implemented & Working** | Filter chips for EPUB, PDF, MOBI, AZW3, CBR, CBZ, and language/extension facets. |
-| | Trending & Curated Lists | **Implemented & Working** | Apple Bestsellers, The Greatest Books, 2000s, African literature, Women authors, Marvel/DC reading orders. |
-| | Nonfiction Awards Catalog | **Implemented & Working** | Compressed text dataset (`awards.dataset`) lazy-parsed into prize winners/finalists. |
-| **Reader Experience** | In-Browser EPUB Reader | **Implemented & Working** | `epubjs` rendition; supports font size, font family, line height, margins, and themes (Light, Sepia, Dark, Slate). |
-| | Reading Progress & Pace Tracking | **Implemented & Working** | Estimates words-per-minute, remaining chapter/book reading time, and saves CFI positions. |
-| | Table of Contents & Bookmarks | **Implemented & Working** | Sheet-based TOC navigation; location bookmarking in reader. |
-| | In-Browser PDF Reader | **Missing** | PDFs delegate to native browser viewer via `<OpenPdfButton>` in a new tab; no reading progress or bookmarking. |
-| | Comic / Manga Reader (CBZ/CBR) | **Missing** | Filter recognizes format; no reader component exists for image archives. |
-| | Plain Text (.txt) Reader | **Missing** | No in-app text file parser or viewer. |
-| **EPUB Converter** | Client-side EPUB to PDF | **Implemented & Working** | Worker-based `bookracy-convertor` produces compressed PDFs with outline bookmarks and fallback fonts. |
-| | Batch Conversion | **Missing** | Only single-item conversion triggerable from book cards. |
-| | Custom Page Layout / Margins | **Partially Implemented** | Fixed A4 layout in engine; no user-facing configuration dialog for margins or page sizes. |
-| **Library & Storage** | IndexedDB Offline Library | **Implemented & Working** | Blobs stored in `bookracy-offline`; metadata persists across sessions; offline filter view available. |
-| | Local File Import | **Implemented & Working** | Allows importing local EPUBs into IndexedDB with locally computed MD5 and extracted cover image. |
-| | Bookmark Folders / Shelves | **Implemented & Working** | Users can create colored folders and assign saved bookmarks. |
-| | Multi-Device Cloud Sync | **Implemented & Working** | Zero-knowledge token sync via Cloudflare KV; hashes account ID with SHA-256 on backend. |
-| | Bulk Management & Batch Actions | **Partially Implemented** | Bulk download queue exists; bulk metadata editing, mass tagging, and bulk shelf assignment are missing. |
-| | Reading Statistics & History | **Partially Implemented** | Basic reading pace hook; no historical reading logs, completed books tracker, or reading goal charts. |
-| **Community & Ecosystem** | Community Uploads | **Implemented & Working** | Users can upload files up to limit; extracted cover stored in R2, metadata in D1. |
-| | Contributor Profiles & Leaderboard | **Implemented & Working** | Tracks upload counts and download counts; supports anonymous or chosen username. |
-| | Admin & Moderation | **Implemented & Working** | Endpoints for banning users, suspending uploads, removing listings, and taking down MD5s. |
-| | Durable Cloud Backups | **Implemented & Working** | Cloudflare Queue pipes books from R2 to Telegram channels and Discord storage; DLQ error ledger. |
-| | Jailbroken Kindle Client | **Implemented & Working** | Dedicated shell scripts served for CLI Kindle search and direct download. |
-| **AI Capabilities** | Grounded Q&A / Summaries | **Missing** | Not yet implemented in frontend or backend. |
+The following classification reflects directly verified repository capabilities:
+- **Implemented and working**: Fully functioning in code, backed by tests or verified logic.
+- **Implemented but needs improvement**: Works, but has usability, scale, or UX gaps.
+- **Partially implemented**: Basic primitives exist, but major features or flows are missing.
+- **Missing**: No implementation exists in the repository.
+- **Not currently practical**: Technically infeasible under current architectural boundaries.
+- **Not recommended**: Counter to security, privacy, or product positioning.
+
+| Feature Domain | Capability | Status | Implementation Evidence | Verification Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Discovery & Search** | Keyword Search | **Implemented & working** | `backend-worker/src/index.ts:searchSources` | **Verified:** Scrapes AA, races LibGen, queries FTS5 index. |
+| | Search Suggestions | **Implemented & working** | `backend-worker/src/apple.ts:searchHints` | **Verified:** Proxies Apple Books `MZSearchHints` with debounce. |
+| | Faceted Filtering | **Implemented & working** | `backend-worker/src/index.ts:filterResults` | **Verified:** In-memory filtering by language and extension. |
+| | Curated Booklists | **Implemented & working** | `frontend/src/routes/recommendations.*.tsx` | **Verified:** The Greatest Books, African Canon, 2000s, Marvel/DC reading orders. |
+| | Nonfiction Awards | **Implemented & working** | `backend-worker/src/awards.ts` | **Verified:** Flat text dataset (`awards.dataset`) parsed into prize lists. |
+| **Reader Experience** | In-Browser EPUB Reader | **Implemented & working** | `frontend/src/components/epub-reader/` | **Verified:** `epubjs` with themes, fonts, margins, TOC, progress. |
+| | PDF In-Browser Reader | **Missing** | `frontend/src/components/books/open-pdf-button.tsx` | **Verified:** Only opens in a browser new tab; no in-app PDF viewer. |
+| | Manga / Comic Reader | **Missing** | None (formats recognized in filters only) | **Verified:** No CBZ/CBR viewer exists in frontend. |
+| | Plain Text (.txt) Reader | **Missing** | None | **Verified:** No text viewer exists in frontend. |
+| | Highlights & Annotations | **Missing** | None | **Verified:** No highlight store or rendition annotation listeners. |
+| | In-Book Full-Text Search | **Missing** | None | **Verified:** No spine search in reader component. |
+| **EPUB Converter** | Client-Side PDF Generation | **Implemented & working** | `epub-converter/src/buildPdf.ts` | **Verified:** 18 passing tests; Flate compression, font sniffing. |
+| | Batch Conversion | **Missing** | None | **Verified:** Only single-item conversion triggered from cards. |
+| | Custom Page Geometry | **Partially implemented** | Hardcoded A4 in `buildPdf.ts` | **Verified:** Engine lacks user-configurable margins/sizes. |
+| **Personal Library** | IndexedDB Offline Storage | **Implemented & working** | `frontend/src/lib/offline-books.ts` | **Verified:** v2 schema with separate `blobs` and `books` stores. |
+| | Local File Ingestion | **Implemented & working** | `frontend/src/lib/import-local-book.ts` | **Verified:** Imports local EPUBs, computes MD5, extracts cover. |
+| | Shelf Folders | **Implemented but needs improvement** | `frontend/src/stores/bookmarks.ts` | **Verified:** Single-level colored folders; no tags or nested shelves. |
+| | Reading Status Triage | **Partially implemented** | `frontend/src/stores/progress.ts` | **Verified:** Tracks reading progress; no Want/Reading/Read shelves. |
+| | Duplicate Detection | **Missing** | None | **Verified:** No duplicate checking during local file import. |
+| | Metadata Editing | **Missing** | None | **Verified:** Users cannot edit title, author, or cover locally. |
+| **Cloud Sync** | Device Synchronization | **Implemented & working** | `frontend/src/lib/sync/cloud.ts` | **Verified:** Syncs bookmarks, folders, progress to Cloudflare KV. |
+| **Community** | Uploads & Leaderboard | **Implemented & working** | `backend-worker/src/community.ts` | **Verified:** D1 metadata, R2 storage, streaming MD5 checks. |
+| | Content Moderation | **Implemented & working** | `backend-worker/src/index.ts:handleAdmin` | **Verified:** User bans, suspensions, upload deletions, takedowns. |
+| **AI Capabilities** | AI Reading Assistant | **Missing** | None | **Verified:** No AI integrations in frontend or backend. |
 
 ---
 
 ## 4. Technical Audit
 
 ### Code Quality & Architecture
-- **Modularity**: Separation between `backend-worker`, `epub-converter`, and `frontend` is clean. The frontend separates data fetching (TanStack Query), state management (Zustand), UI components (Radix primitives), and page routes (TanStack Router).
-- **Backend Concurrency**: `backend-worker/src/concurrency.ts` implements bounded parallel execution with semaphore controls, preventing subrequest exhaustion in Cloudflare Workers.
-- **Resilient Fallbacks**: Search implements multi-tiered fallbacks. If live providers fail, the backend degrades gracefully to SQLite FTS5 index queries on previously indexed books.
+- **Modularity [Verified]**: Clean boundary separation between `backend-worker`, `epub-converter`, and `frontend`. The backend leverages structured submodules (`reliability.ts`, `concurrency.ts`, `searchindex.ts`, `storage/backup.ts`).
+- **Concurrency & Resource Management [Verified]**: `backend-worker/src/concurrency.ts` implements bounded execution with concurrency pools, avoiding Cloudflare subrequest exhaustion.
+- **Edge Cache Invalidation [Verified]**: Cache API keys (`coverCacheKey`, `METADATA_CACHE_VERSION`) isolate edge cache entries and permit atomic invalidation on updates.
 
-### Type Safety
-- TypeScript is enforced across all subprojects with strict compiler options.
-- The backend types Cloudflare Worker environment bindings (`Env`, D1Database, R2Bucket, KVNamespace, RateLimiter).
-- Frontend queries are validated with Zod schemas (`frontend/src/api/backend/types.ts`).
-- **Build Order Sensitivity**: `frontend` depends on `bookracy-convertor` via local file reference. Running `pnpm build` in `frontend` without first running `pnpm build` in `epub-converter` produces type declaration errors. A monorepo build script or root workspace orchestration is needed.
+### Type Safety & Build Tooling
+- **Strict Typing [Verified]**: TypeScript strict mode enabled across subprojects. Cloudflare Worker environment variables and bindings are typed via `Env` interface. Zod schemas validate backend API responses.
+- **Monorepo Dependency Risk [Verified]**: `frontend/package.json` references `file:../epub-converter`. Running `pnpm build` in `frontend` without building `epub-converter` produces type declaration missing errors (`Cannot find module 'bookracy-convertor'`).
+- **Linter Deprecations [Verified]**: ESLint v9 flat configurations report deprecated package warnings in `epub-converter` and `frontend`. Non-component exports in `filters.tsx` and `button.tsx` trigger Fast Refresh warnings.
 
-### Performance & Scalability
-- **Bundle Optimization**: Frontend Vite build splits vendor chunks (Radix, Lucide, epubjs, jszip, html2canvas). Gzipped core bundle is ~287 KB, and the service worker is 1.96 KB.
-- **Edge Efficiency**:
-  - Cloudflare R2 serves cached covers and books with zero egress fees.
-  - Rate limiting is separated into distinct namespaces (`SEARCH_LIMITER`, `MD5_LIMITER`, `METADATA_LIMITER`, `COVER_LIMITER`) to prevent bulk bookshelf hydration from starving search quotas.
-  - Lazily parsed datasets (`awards.dataset` text format) avoid JSON parse overhead on Worker cold starts.
-- **Memory Management in Converter**: jsPDF Flate compression and streaming chunking keep memory usage predictable during conversion.
+### Performance & Responsiveness
+- **Edge Efficiency [Verified]**: R2 caching eliminates egress costs for repeated downloads and book covers. D1 FTS5 external content virtual table provides fast text search with diacritic folding (`search_index_fts`).
+- **Frontend Bundle Size [Verified]**: Vite bundle analysis demonstrates code splitting:
+  - Core app chunk: ~287 KB gzipped.
+  - EPUB converter worker: 858 KB uncompressed (offloaded from main thread).
+  - Service worker: 1.96 KB gzipped.
+- **Client Large Library Scalability [Verified / Inferred Limitation]**: `OfflineLibrary` (`frontend/src/components/downloads/offline-library.tsx`) renders books in an unvirtualized DOM grid. Managing libraries with >500 books will degrade rendering performance without virtualization.
 
 ### Testing Coverage
-- **Backend Worker**: 148 automated unit and integration tests passing (`pnpm test` via Node test runner). Covers mirror backoff, stream resumption, FTS query sanitization, filename cleaning, and takedown sets.
-- **EPUB Converter**: 18 unit tests passing (`pnpm test` via `tsx`). Validates line wrapping, font sniffing, outline bookmarks, fallback fonts, and abort signals.
-- **Frontend**: Currently lacks automated component and end-to-end browser tests. Testing is limited to TypeScript type checking (`tsc --noEmit`) and ESLint.
-
-### Technical Debt & Maintenance Concerns
-1. **ESLint Deprecation Warnings**: ESLint v9 flat config in `epub-converter` and `frontend` triggers deprecation warnings for specific plugins.
-2. **Fast Refresh Export Warnings**: `frontend/src/components/books/filters.tsx`, `button.tsx`, and `main.tsx` export non-component constants triggering Vite React Refresh warnings.
-3. **Monorepo Build Coupling**: Lack of root-level build tooling requires manual sequential building of `epub-converter` before frontend builds.
+- **Backend Worker [Verified]**: 148 automated tests passing (`node --test`). Comprehensive coverage of URL parsing, stream resumption, FTS5 operator sanitization, mirror backoff, and takedown sets.
+- **EPUB Converter [Verified]**: 18 automated tests passing (`node --import tsx --test`). Covers line wrapping, font sniffing, outline bookmarks, fallback fonts, and abort signals.
+- **Frontend [Verified / Limitation]**: Currently lacks automated component, unit, or Playwright end-to-end browser tests. Testing is limited to static analysis (`tsc --noEmit`, `eslint src/`).
 
 ---
 
 ## 5. UX/UI Audit Across Reader Personas
 
 ### 1. Casual Ebook Reader
-- **Current Experience**: Seamless. Users can search for a title, view book details and ratings from Apple Books, download an EPUB with a single click, and read immediately in the responsive browser reader.
-- **Gaps**: Reader lacks page curl/transition animations, customizable line-spacing presets, and one-click font switching between common serif/sans-serif standards.
+- **Current Experience [Verified]**: High usability. Fast search, book covers, Apple Books ratings and summaries, one-click EPUB reading in-browser.
+- **Gaps [Verified]**: Missing page-turn animations, one-click font presets, and reading goals.
 
 ### 2. Manga and Comic Reader
-- **Current Experience**: Poor. While search filters allow filtering by `.cbz` and `.cbr` formats, opening a comic file provides no in-app reading viewer. Users are forced to download the raw archive and use third-party software.
-- **Opportunities**: Implement a canvas/WebGL image archive reader supporting right-to-left manga page flow, dual-page landscape mode, and pinch-to-zoom.
+- **Current Experience [Verified]**: Incomplete. Formats `.cbz` and `.cbr` appear in search filters, but cannot be read in the application. Clicking open offers only raw file download.
+- **Gaps [Verified]**: Missing canvas/image archive reader, right-to-left manga page flow, and zoom controls.
 
 ### 3. Student
-- **Current Experience**: Moderate. Students can find textbooks and papers in PDF or EPUB. EPUB-to-PDF conversion enables exporting readable PDFs for external annotation.
-- **Gaps**: No in-app text highlighting, note-taking, passage copy with academic citations, or exportable reading summaries. PDF documents cannot be annotated inside Bookracy.
+- **Current Experience [Verified]**: Moderate. EPUB-to-PDF conversion enables exporting documents. Academic papers in PDF can be downloaded.
+- **Gaps [Verified]**: No in-app PDF viewing, text highlighting, margin notes, or copy-with-citation features.
 
 ### 4. Technical Reader
-- **Current Experience**: Suboptimal. Code blocks in technical EPUBs often suffer from clumsy line breaking or formatting degradation in the reader.
-- **Opportunities**: Monospace font support, code block syntax styling, and integrated table viewing.
+- **Current Experience [Verified]**: Suboptimal. Code listings inside technical EPUBs suffer from improper wrapping or monospace formatting degradation.
+- **Gaps [Verified]**: Missing monospace font selector, code block styling, and table viewing mode.
 
 ### 5. Document Manager (Hundreds or Thousands of Documents)
-- **Current Experience**: Restricted. The IndexedDB offline library can store dozens of files, but managing hundreds of documents degrades UI responsiveness due to unvirtualized lists and lack of multi-level taxonomy.
-- **Gaps**: No multi-select batch tag assignment, nested subfolders, bulk export/backup, or full-text client document search.
+- **Current Experience [Verified]**: Severely constrained. Offline library supports manual single-file imports, but lacks batch operations.
+- **Gaps [Verified]**: No bulk directory import, multi-select tagging, nested folders, or full-text client search across stored documents.
 
-### 6. Power User with a Large Digital Library
-- **Current Experience**: Functional but basic. Cloud sync backs up bookmarks, folders, and reading progress across devices via a bearer account ID.
-- **Gaps**: No duplicate detection on import, no smart collections (e.g., "Unread EPUBs added this month"), no reading statistics dashboard, and no integration with Calibre or OPDS library feeds.
+### 6. Power User with Large Digital Library
+- **Current Experience [Verified]**: Basic. Cloud sync backs up bookmarks, shelves, and reading progress across devices.
+- **Gaps [Verified]**: No duplicate detection on import, no smart dynamic collections, no reading statistics dashboard, and no OPDS server feed for external e-ink readers.
 
 ---
 
 ## 6. Security and Privacy Audit
 
-### Authentication & Identification
-- Bookracy employs a privacy-first, zero-knowledge account architecture:
-  - User accounts have no email, password, or PII.
-  - Accounts are identified solely by a high-entropy client-generated bearer key.
-  - The backend stores and keys records by `sha256(accountId)`, ensuring a database leak cannot reverse-engineer user credentials.
+### Authentication & Account Security [Verified]
+- **Key Generation & Storage**: Accounts are created via `POST /api/account` (`backend-worker/src/index.ts:handleAccount`), which mints a cryptographically random 64-character hex token (`crypto.getRandomValues(32)`).
+- **Bearer Credential**: The 64-hex string is the user's sole credential. It is transmitted in the HTTP `Authorization: Bearer <token>` header over TLS.
+- **Not Zero-Knowledge**: The system does **not** employ zero-knowledge client-side encryption. While contributor IDs are stored in D1 as `sha256(token)` to prevent credential leakage from database dumps, the user's synchronization blob is stored in plaintext JSON in Cloudflare KV (`SYNC` namespace: `acct:<token>`). The server can read all synchronized bookmarks, folder names, and reading progress.
+- **Account Recovery & Loss**: There is no email, password reset, or recovery mechanism. If the bearer key is lost, access cannot be restored. If stolen, an attacker has full read/write/delete access to the sync account.
+- **Bot Gate**: Account creation is rate-limited (`ACCOUNT_CREATE_LIMITER`, 5/60s) and gated by Cloudflare Turnstile when `TURNSTILE_SECRET` is configured.
 
-### File Handling & Upload Validation
-- Community uploads are validated on the backend:
-  - File extension and MIME type allowlists.
-  - Size enforcement bounded to Worker payload limits.
-  - Content MD5 hash verification matches uploaded bytes.
-  - Content moderation capabilities allow administrators to hide or ban abusers and purge malicious files.
+### File Upload & Download Security [Verified]
+- **Server-Side Enforcement**: Security boundaries are enforced server-side in `handleUploadCreate` (`backend-worker/src/index.ts`):
+  - **MIME & Extension Allowlists**: Enforces `UPLOAD_EXT_ALLOW` (`epub`, `pdf`, `mobi`, `azw3`, `cbz`, `cbr`, `djvu`, `fb2`, `txt`, `doc`, `docx`, `rtf`).
+  - **Content Integrity**: Body is streamed through a hashing transform stream; the computed MD5 must match the declared MD5 query parameter.
+  - **Magic-Byte Signature Verification**: `isAllowedBookBytes` inspects leading bytes (e.g. `PK\x03\x04` for EPUB/CBZ, `%PDF` for PDF, `Rar!` for CBR). Rejects known executable headers (`MZ`, `ELF`, Mach-O).
+  - **Payload Limits**: Rejects payloads exceeding `MAX_UPLOAD_BYTES` (default 100 MB).
+- **Security Limitations & Archive Vulnerabilities [Verified]**:
+  - The backend does **not** decompress or inspect archive internals on upload. It does not verify ZIP compression ratios (ZIP bomb vulnerability) or scan for path traversal within archives (`../../`).
+  - The backend does not run antivirus or malware analysis on uploaded binary files.
+  - Malformed EPUBs or PDFs could exploit parser vulnerabilities in downstream client readers (`epubjs`, browser PDF viewers).
+- **Takedown Enforcement**: `takedown.isTakenDown` checks MD5s and title/author patterns before consulting caches or sources. Takedown matches trigger `purgeTakedown` to purge R2, KV, D1, and backup queues.
 
-### Edge Rate Limiting & Denial of Service Protection
-- Cloudflare rate limits protect backend endpoints against scraping and DDoS:
-  - Dedicated limiter for free-text search (30 req/min).
-  - Dedicated limiter for account creation (5 req/min).
-  - Dedicated limiter for community uploads (10 req/min).
-  - Generous burst limiters for cover caching and MD5 bookmark lookups.
-
-### Takedown Compliance
-- `backend-worker/src/takedown.ts` maintains an explicit set of blocked MD5s and title/author patterns. Blocked items are rejected at download resolution, cover rendering, and background queue ingest.
+### Privacy & Third-Party Data Flows [Verified]
+- **Search Query Exposure**: Uncached search queries are transmitted directly to external search providers (Anna's Archive and Library Genesis mirrors) via Cloudflare Worker egress.
+- **Apple Metadata Lookups**: Book title and author queries are sent to Apple Books APIs (`amp-api.books.apple.com`, `search.itunes.apple.com`).
+- **Cloudflare Infrastructure**: All cached files, covers, sync data, and D1 databases reside on Cloudflare infrastructure subject to Cloudflare terms and privacy policies.
+- **Durable Backup Providers**: Books enqueued for durable backup are chunked and transmitted to third-party Telegram Bot API and Discord Webhook/Channel endpoints.
 
 ---
 
 ## 7. Feature Gap Analysis
 
-| Feature Domain | Master Specification Requirement | Current State | Gap Classification | Recommended Action |
+| Feature Domain | Master Specification Requirement | Current Implementation State | Gap Classification | Recommended Action |
 | :--- | :--- | :--- | :--- | :--- |
-| **Reading Formats** | EPUB reader | Implemented | Working | Enhance typography & themes |
-| | PDF reader | Browser new tab only | **Missing** | Embed PDF.js reader with progress |
-| | CBZ/CBR manga reader | None | **Missing** | Build image-archive viewer |
-| | TXT document reader | None | **Missing** | Implement clean text reader |
-| **Reader Features** | Reading themes & typography | 4 themes, font size slider | Needs Improvement | Add line-height, letter spacing, margins |
-| | Highlights & Notes | None | **Missing** | Implement CFI-based highlight store |
-| | Full-text search in reader | None | **Missing** | Integrate epubjs spine search |
-| | Reading progress & pace | Implemented | Working | Preserve and expose stats |
-| **Personal Library** | Custom collections & folders | Single-level colored folders | Needs Improvement | Add nested tags & smart collections |
-| | Reading status (Want/Reading/Read) | Reading progress only | Partially Implemented | Add formal status triaging |
-| | Bulk import & management | Single local file import | Partially Implemented | Support folder drag-and-drop & bulk actions |
-| | Duplicate detection | None | **Missing** | Match MD5 and title similarity on import |
-| | Metadata editor | None | **Missing** | Allow local editing of title/author/cover |
-| **Document Processing**| EPUB to PDF conversion | Client worker conversion | Working | Add page size & margin options |
-| | Batch conversion | None | **Missing** | Queue multiple conversions |
-| **Offline & Sync** | IndexedDB storage | v2 schema with blob separation | Working | Add storage quota dashboard |
-| | Cloud sync | KV metadata sync | Working | Extend sync schema for notes/tags |
-| **AI Capabilities** | Grounded reading assistant | None | **Missing** | Design privacy-first client LLM API integration |
-| **Community** | Community uploads & Leaderboard | Implemented in D1/R2 | Working | Add content reporting & preview |
+| **Reading Formats** | EPUB Reader | Full in-app reader (`epubjs`) | Implemented & working | Polish typography & theme options |
+| | PDF Reader | Browser new tab only | **Missing** | Implement embedded PDF.js reader |
+| | CBZ/CBR Comic Reader | Format filter only | **Missing** | Build canvas-based archive viewer |
+| | Plain Text (.txt) Reader | None | **Missing** | Build virtualized text document viewer |
+| **Reader Features** | Reading Themes & Typography | 4 themes, font size slider | Implemented but needs improvement | Add line-height, letter spacing, font options |
+| | Highlights & Notes | None | **Missing** | Implement CFI-based highlight engine |
+| | In-Book Full-Text Search | None | **Missing** | Integrate `epubjs` spine text search |
+| | Reading Progress & Pace | Measured pace, saves CFI | Implemented & working | Preserve stats in library view |
+| **Personal Library** | Custom Shelves / Folders | Single-level colored folders | Implemented but needs improvement | Add nested folders & multi-tagging |
+| | Reading Status Triage | Progress tracking only | Partially implemented | Add Want to Read / Finished shelves |
+| | Bulk Ingestion | Single file import only | Partially implemented | Add folder drag-and-drop batch import |
+| | Duplicate Detection | None | **Missing** | Detect duplicate MD5s and similar titles |
+| | Metadata Management | None | **Missing** | Enable local editing of book metadata |
+| **Conversion Engine** | Client EPUB to PDF | Web Worker jsPDF converter | Implemented & working | Add page geometry presets |
+| | Batch Conversion | None | **Missing** | Queue multiple document conversions |
+| **Offline & Sync** | IndexedDB Storage | v2 schema with blob store | Implemented & working | Add storage quota dashboard |
+| | Multi-Device Cloud Sync | KV sync with bearer key | Implemented & working | Add optional client-side encryption |
+| **AI Capabilities** | AI Reading Assistant | None | **Missing** | Design grounded client LLM API integration |
+| **Community** | Uploads & Leaderboard | D1 metadata & R2 storage | Implemented & working | Add archive safety checks & reporting |
 
 ---
 
 ## 8. Prioritized Roadmap
 
+Complexity Scale:
+- **XS**: Very small (< 1 day)
+- **S**: Small (1–3 days)
+- **M**: Medium (1–2 weeks)
+- **L**: Large (2–4 weeks)
+- **XL**: Very large / architectural (> 4 weeks)
+
 ### Phase P0 — Critical Reliability, Security & Developer Foundation
-*Objective: Solidify existing systems, eliminate build fragility, and reinforce upstream resilience.*
+*Objective: Solidify build tooling, eliminate developer friction, and harden external provider resilience.*
 
-1. **Monorepo Build Orchestration & Dependency Alignment**
-   - *User Value*: Guarantees consistent builds, eliminates CI/CD failures.
-   - *Technical Complexity*: Low.
-   - *Dependencies*: None.
-   - *Risks*: Build script discrepancies across environments.
-   - *Acceptance Criteria*: Root build command (`pnpm run build`) builds `epub-converter` before `frontend`; typechecks pass cleanly on clean clone.
+#### P0.1 Monorepo Build Orchestration & Dependency Alignment
+- **Problem**: Building `frontend` fails on clean clones if `epub-converter` has not been compiled first, due to local `file:../epub-converter` dependency linkage.
+- **User Value**: Ensures deterministic builds, eliminates CI/CD failures, simplifies developer onboarding.
+- **Technical Complexity**: **S**
+- **Dependencies**: None.
+- **Prerequisite For**: All subsequent frontend and converter milestones.
+- **Risks**: Package manager workspace compatibility.
+- **Acceptance Criteria**: Running `pnpm run build` from repository root builds `epub-converter` before `frontend`; clean-clone build succeeds without errors.
+- **Testing Requirements**: Automated build script verification on clean clone.
 
-2. **Upstream Failure & Degradation Hardening**
-   - *User Value*: Clearer feedback when external providers (LibGen/AA) suffer outages.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: Backend rate limiters.
-   - *Risks*: Over-caching stale error states.
-   - *Acceptance Criteria*: Frontend displays helpful fallback alerts when live sources are down, offering FTS-indexed results seamlessly.
+#### P0.2 Upstream Provider Outage UX & Degradation Signaling
+- **Problem**: When external search mirrors (LibGen / AA) encounter CAPTCHAs or timeouts, users receive generic errors without clear context.
+- **User Value**: Explains search degradation and automatically offers remembered FTS5 results.
+- **Technical Complexity**: **M**
+- **Dependencies**: Backend search endpoints.
+- **Prerequisite For**: Search enhancements.
+- **Risks**: Caching transient error responses.
+- **Acceptance Criteria**: Frontend displays informative status banner when live providers fail; seamlessly presents cached/FTS5 results.
+- **Testing Requirements**: Mocked 5xx/429 upstream tests; UI degradation verification.
 
-3. **Client-Side Upload Validation & Malware Guardrails**
-   - *User Value*: Protects community library against corrupt or malicious files.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: Community upload endpoints.
-   - *Risks*: False positives on unusual EPUB formats.
-   - *Acceptance Criteria*: Client validates EPUB/PDF archive integrity and structure before initiating upload.
+#### P0.3 Server-Side Upload Archive Safety & Zip Bomb Guardrails
+- **Problem**: Community uploads only check leading magic bytes. Archives are not inspected for path traversal or malicious decompression ratios.
+- **User Value**: Protects the community library and user devices from corrupted or malicious archive payloads.
+- **Technical Complexity**: **M**
+- **Dependencies**: `handleUploadCreate`.
+- **Prerequisite For**: Community expansion.
+- **Risks**: Execution timeout within Cloudflare Worker 50ms CPU limits.
+- **Acceptance Criteria**: Worker inspects ZIP central directory headers; rejects compression ratios > 100:1 and archive paths with `../`.
+- **Testing Requirements**: Automated integration tests with malformed ZIPs and path traversal archives.
 
 ---
 
 ### Phase P1 — Core Reading Experience
-*Objective: Transform Bookracy into a first-class reading application.*
+*Objective: Make Bookracy an exceptional everyday reader across major reading formats.*
 
-1. **Embedded PDF Reader with Progress Tracking**
-   - *User Value*: Read PDFs directly in Bookracy on mobile and desktop without opening external tabs; save reading position.
-   - *Technical Complexity*: High.
-   - *Dependencies*: `pdfjs-dist`.
-   - *Risks*: Memory footprint of large PDF documents on mobile browsers.
-   - *Acceptance Criteria*: In-app modal/page viewer for PDFs with page navigation, zoom, thumbnail sidebar, and local progress persistence.
+#### P1.1 Embedded PDF Reader with Progress Tracking
+- **Problem**: PDFs currently open in a generic browser new tab via `<OpenPdfButton>`, losing reading position, theme consistency, and offline reader integration.
+- **User Value**: Read PDFs inside Bookracy with page persistence, zoom, and consistent styling across desktop and mobile.
+- **Technical Complexity**: **L**
+- **Dependencies**: `pdfjs-dist`.
+- **Prerequisite For**: Document annotations and AI reading assistant.
+- **Risks**: High memory usage of large scanned PDF files on mobile browsers.
+- **Acceptance Criteria**: In-app PDF reader modal/route supporting continuous scroll, page navigation, zoom, and IndexedDB progress persistence.
+- **Testing Requirements**: Unit tests for PDF loader; cross-browser mobile rendering tests.
 
-2. **Highlights, Annotations, and Reader Bookmarks**
-   - *User Value*: Highlight passages in EPUBs, attach personal notes, and review annotations in a unified drawer.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: `epubjs` rendition annotations API.
-   - *Risks*: CFI synchronization across varying screen dimensions.
-   - *Acceptance Criteria*: Text selection triggers annotation toolbar; highlights persist in IndexedDB and sync across devices.
+#### P1.2 Highlights, Annotations, and Reader Drawer
+- **Problem**: Students and technical readers cannot highlight passages or record notes.
+- **User Value**: Annotate text selections; review, export, and search personal notes.
+- **Technical Complexity**: **M**
+- **Dependencies**: `epubjs` rendition annotations API; P1.1 for PDF annotations.
+- **Prerequisite For**: AI study notes and flashcard generation.
+- **Risks**: CFI position drift across screen resizes or font changes.
+- **Acceptance Criteria**: Text selection displays annotation menu; highlights persist in IndexedDB and synchronize via Cloud Sync.
+- **Testing Requirements**: Annotation persistence tests; CFI stability tests.
 
-3. **In-Book Full-Text Search**
-   - *User Value*: Find terms, quotes, or character names instantly within the currently open book.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: `epubjs` search API.
-   - *Risks*: Search performance on large books (>500 pages).
-   - *Acceptance Criteria*: Search input inside reader sheet yields navigable excerpt results with direct navigation.
+#### P1.3 In-Book Full-Text Search
+- **Problem**: Readers cannot search for characters, terms, or quotes within the active book.
+- **User Value**: Fast navigation to relevant passages within long books.
+- **Technical Complexity**: **M**
+- **Dependencies**: Active reader component (`epubjs` spine / PDF.js text layer).
+- **Prerequisite For**: None.
+- **Risks**: Performance lag during client-side indexing of large books.
+- **Acceptance Criteria**: Search bar in reader TOC sheet displays search results with surrounding excerpt snippets; clicking navigates directly.
+- **Testing Requirements**: Benchmarks on 1000-page EPUB search.
 
-4. **Typography & Layout Customization Expansion**
-   - *User Value*: Comfortable reading tailored to dyslexia, low-vision, or aesthetic preference.
-   - *Technical Complexity*: Low.
-   - *Dependencies*: Reader store.
-   - *Risks*: CSS specificity conflicts with publisher styles.
-   - *Acceptance Criteria*: Controls for line height, paragraph spacing, letter spacing, margin width, and dyslexia-friendly fonts (OpenDyslexic).
+#### P1.4 Reader Typography & Ergonomic Customization
+- **Problem**: Limited typography options for users with dyslexia, astigmatism, or specific formatting preferences.
+- **User Value**: Highly comfortable, accessible reading tailored to user needs.
+- **Technical Complexity**: **S**
+- **Dependencies**: `reader.ts` store.
+- **Prerequisite For**: None.
+- **Risks**: Style collisions with publisher-specified CSS.
+- **Acceptance Criteria**: Sliders for line spacing, paragraph margins, letter spacing; font options including OpenDyslexic, Literata, and Fira Code.
+- **Testing Requirements**: Appearance store state persistence unit tests.
 
 ---
 
 ### Phase P2 — Personal Library & Document Management
-*Objective: Calibre-grade organization and personal library curation.*
+*Objective: Provide Calibre-grade organization, curation, and bulk management for large collections.*
 
-1. **Reading Status & Triage System (Want to Read / Currently Reading / Finished)**
-   - *User Value*: Readers can categorize their catalog and track reading achievements.
-   - *Technical Complexity*: Low.
-   - *Dependencies*: `bookmarks.ts` store.
-   - *Risks*: Data migration for existing bookmarks.
-   - *Acceptance Criteria*: Filterable shelves for reading states with automatic status transition when reaching 100% progress.
+#### P2.1 Reading Status Shelves (Want to Read / Currently Reading / Finished)
+- **Problem**: Bookmarks only support folder assignment; users cannot triage reading state or track finished books.
+- **User Value**: Structured reading management and goal tracking.
+- **Technical Complexity**: **S**
+- **Dependencies**: `bookmarks.ts` store schema migration.
+- **Prerequisite For**: Reading statistics dashboard.
+- **Risks**: Breaking backward compatibility with existing synced bookmark payloads.
+- **Acceptance Criteria**: Formal reading status field; dedicated library views; automatic status transition when progress reaches 100%.
+- **Testing Requirements**: Sync schema backward-compatibility migration tests.
 
-2. **Bulk Document Import & Folder Ingestion**
-   - *User Value*: Drag-and-drop entire folders of documents into Bookracy.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: File System Access API / webkitdirectory.
-   - *Risks*: Browser memory exhaustion when importing hundreds of files.
-   - *Acceptance Criteria*: Batch importer processes files sequentially with progress modal, extracting metadata and covers.
+#### P2.2 Bulk Document Import & Folder Ingestion
+- **Problem**: Users with hundreds of existing ebooks must import them one by one.
+- **User Value**: Effortless library migration from Calibre or local folders.
+- **Technical Complexity**: **M**
+- **Dependencies**: File System Access API / HTML directory input.
+- **Prerequisite For**: Large-library document management.
+- **Risks**: Browser memory exhaustion during mass file reads.
+- **Acceptance Criteria**: Drag-and-drop folder import; sequential queue processing; progress bar with cancellation support.
+- **Testing Requirements**: Batch import tests with 100+ files.
 
-3. **Duplicate Detection & Metadata Management**
-   - *User Value*: Avoid duplicate files; correct erroneous titles, authors, or covers.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: Offline library store.
-   - *Risks*: Local metadata divergence from backend index.
-   - *Acceptance Criteria*: System flags identical MD5s or similar title/author pairs; inline dialog allows editing metadata.
+#### P2.3 Duplicate Detection & Metadata Editor
+- **Problem**: Repeated downloads or imports create duplicate records; downloaded books often have incorrect titles or missing covers.
+- **User Value**: Clean, uncluttered library catalog; ability to fix inaccurate metadata.
+- **Technical Complexity**: **M**
+- **Dependencies**: `offline-books.ts`.
+- **Prerequisite For**: Smart collections.
+- **Risks**: Divergence between local metadata and remote search index.
+- **Acceptance Criteria**: Flags duplicate MD5s or high title/author similarity; edit dialog allows modifying title, author, and cover.
+- **Testing Requirements**: String similarity matching unit tests; IndexedDB update tests.
 
-4. **Tagging & Smart Filter Collections**
-   - *User Value*: Flexible organization beyond single-parent folders.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: Zustand store.
-   - *Risks*: Complex query performance on large client libraries.
-   - *Acceptance Criteria*: Multi-tag support per book; dynamic smart views (e.g. "Unfinished PDFs added >30 days ago").
+#### P2.4 Tagging, Virtualized Lists & Smart Collections
+- **Problem**: UI performance degrades with hundreds of books in DOM; single-level folders prevent flexible classification.
+- **User Value**: Instant UI responsiveness in large libraries; multi-tag categorization; dynamic collections (e.g. "Unread Tech PDFs").
+- **Technical Complexity**: **L**
+- **Dependencies**: `@tanstack/react-virtual`.
+- **Prerequisite For**: None.
+- **Risks**: State synchronization complexity across filters.
+- **Acceptance Criteria**: DOM virtualization renders 5,000+ items at 60fps; multi-tag assignment per book; dynamic smart filter queries.
+- **Testing Requirements**: Rendering performance benchmarks with 2,000 synthetic items.
 
 ---
 
 ### Phase P3 — Advanced Reading Formats & Conversion
-*Objective: Comic/Manga support and advanced document conversion.*
+*Objective: Expand format support to manga, comics, text documents, and advanced PDF creation.*
 
-1. **Manga & Comic Viewer (CBZ / CBR)**
-   - *User Value*: Native reading experience for manga, comics, and graphic novels.
-   - *Technical Complexity*: High.
-   - *Dependencies*: `jszip` (CBZ), client unrar (CBR).
-   - *Risks*: Decompression memory overhead on low-memory mobile devices.
-   - *Acceptance Criteria*: Canvas/image reader supporting Right-to-Left (Manga) and Left-to-Right reading, double-page spreads, and vertical webtoon scrolling.
+#### P3.1 Comic & Manga Reader (CBZ & CBR)
+- **Problem**: Comic fans cannot read `.cbz` or `.cbr` archives inside Bookracy.
+- **User Value**: Native graphic novel and manga reading experience on mobile and desktop.
+- **Technical Complexity**: **L**
+- **Dependencies**: `jszip` (CBZ), unrar WebAssembly / pure JS (CBR).
+- **Prerequisite For**: None.
+- **Risks**: Memory footprint of uncompressed high-resolution comic pages.
+- **Acceptance Criteria**: Image archive reader supporting Right-to-Left (manga) and Left-to-Right page turns, double-page landscape spreads, and fit-to-width scrolling.
+- **Testing Requirements**: Memory leak profiling during 100-page archive paging.
 
-2. **Plain Text (.txt) and Markdown (.md) Reader**
-   - *User Value*: Clean, distraction-free reading of notes, transcripts, and public domain text files.
-   - *Technical Complexity*: Low.
-   - *Dependencies*: Virtualized text renderer.
-   - *Risks*: Large text file layout virtualization.
-   - *Acceptance Criteria*: Opens .txt and .md with matching typography settings and progress tracking.
+#### P3.2 Plain Text (.txt) and Markdown (.md) Reader
+- **Problem**: Documents in text or Markdown format cannot be opened in-app.
+- **User Value**: Clean, distraction-free reading of notes, transcripts, and public domain text files.
+- **Technical Complexity**: **S**
+- **Dependencies**: Virtualized text display component.
+- **Prerequisite For**: None.
+- **Risks**: Large plain text files (>10 MB) blocking the main thread.
+- **Acceptance Criteria**: In-app viewer with font and theme options, progress tracking, and text search.
+- **Testing Requirements**: Large text file loading benchmarks.
 
-3. **Advanced EPUB-to-PDF Conversion Profiles**
-   - *User Value*: Produce customized printable PDFs tailored for specific e-readers or print formats.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: `bookracy-convertor`.
-   - *Risks*: Pagination inconsistencies across custom page dimensions.
-   - *Acceptance Criteria*: Conversion dialog offering presets (A4, A5, US Letter, Kindle 6 inch), custom margins, and font scaling.
+#### P3.3 Advanced EPUB-to-PDF Conversion Profiles
+- **Problem**: `bookracy-convertor` only generates fixed-dimension A4 PDFs with default margins.
+- **User Value**: Create print-ready PDFs formatted specifically for e-ink readers (e.g., 6" screens) or paper printing.
+- **Technical Complexity**: **M**
+- **Dependencies**: `bookracy-convertor`.
+- **Prerequisite For**: None.
+- **Risks**: Pagination layout regressions across non-standard aspect ratios.
+- **Acceptance Criteria**: Conversion modal offering presets (A4, A5, US Letter, 6-inch E-Reader), custom margins, and font scaling.
+- **Testing Requirements**: Visual regression test comparing output across conversion profiles.
 
 ---
 
-### Phase P4 — Bookracy AI Assistant
-*Objective: Intelligent reading, comprehension, and learning tools.*
+### Phase P4 — Bookracy AI Reading Assistant
+*Objective: Context-grounded comprehension, learning, and research tools.*
 
-1. **Passage Explanation & Contextual Definitions**
-   - *User Value*: Instant explanation of complex terms, foreign phrases, or archaic language without leaving the reading view.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: Cloudflare Workers AI or BYO-API key (OpenAI/Anthropic).
-   - *Risks*: Privacy leakage, latency.
-   - *Acceptance Criteria*: Selecting text exposes "Explain with AI" popup; respects user privacy settings; grounded strictly in excerpt context.
+#### P4.1 Privacy-First Passage Explanation & Vocabulary Lookup
+- **Problem**: Technical and academic readers frequently encounter unfamiliar terminology or archaic passages.
+- **User Value**: Instant contextual explanations without breaking reading immersion.
+- **Technical Complexity**: **M**
+- **Dependencies**: Reader selection toolbar; LLM provider (Cloudflare Workers AI or BYO API Key).
+- **Prerequisite For**: Chapter summarization.
+- **Risks**: Exposing book text to third parties; hallucinations.
+- **Acceptance Criteria**: Selected text offers "Explain with AI"; prompt strictly grounds answer in excerpt context; supports user-configured API keys.
+- **Testing Requirements**: Mocked LLM response tests; privacy opt-in verification.
 
-2. **Chapter Summarization & Study Notes**
-   - *User Value*: Quickly recap prior chapters before resuming reading.
-   - *Technical Complexity*: High.
-   - *Dependencies*: In-browser chunking and backend AI worker.
-   - *Risks*: Context window limits, hallucinations.
-   - *Acceptance Criteria*: Generates concise chapter summaries with citations; exportable to Markdown.
+#### P4.2 Chapter Summarization & Study Note Generator
+- **Problem**: Students and readers returning to a book struggle to recall prior events or key arguments.
+- **User Value**: Concise recaps of completed chapters; exportable study notes.
+- **Technical Complexity**: **L**
+- **Dependencies**: P4.1; EPUB text extraction.
+- **Prerequisite For**: Cross-library knowledge search.
+- **Risks**: Token limit overflow on long chapters.
+- **Acceptance Criteria**: Generates chapter summaries with source passage citations; exportable as Markdown notes.
+- **Testing Requirements**: Chunking and token truncation tests.
 
-3. **Library Knowledge Search (Ask Your Books)**
-   - *User Value*: Ask questions across your personal collection of books and documents.
-   - *Technical Complexity*: Very High.
-   - *Dependencies*: Vector embeddings (Cloudflare Vectorize) or client-side vector store.
-   - *Risks*: Storage limits and compute cost.
-   - *Acceptance Criteria*: Natural language queries return relevant passage snippets across personal books.
+#### P4.3 Cross-Library Knowledge Search ("Ask Your Books")
+- **Problem**: Readers cannot query factual knowledge across their collected books and papers.
+- **User Value**: Powerful personal research assistant synthesizing information across a private digital library.
+- **Technical Complexity**: **XL**
+- **Dependencies**: Vector embeddings engine (Cloudflare Vectorize or local vector index).
+- **Prerequisite For**: None.
+- **Risks**: High storage and compute costs; indexing latency.
+- **Acceptance Criteria**: Natural language questions return synthesized answers with direct citations linking to book passages.
+- **Testing Requirements**: Precision and recall evaluation on test reference corpus.
 
 ---
 
 ### Phase P5 — Community & Ecosystem
-*Objective: Expand community library features, curation, and integrations.*
+*Objective: Expand community sharing, metadata curation, and external e-reader integrations.*
 
-1. **Community Collections & Public Booklists**
-   - *User Value*: Discover curated reading lists created by other community members.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: Cloudflare D1 community tables.
-   - *Risks*: Moderation workload.
-   - *Acceptance Criteria*: Users can publish public reading lists with titles and notes; browse community-curated collections.
+#### P5.1 Community Public Collections & Curated Lists
+- **Problem**: Users cannot share their reading lists or discover lists curated by other readers.
+- **User Value**: Rich community discovery and social recommendations.
+- **Technical Complexity**: **M**
+- **Dependencies**: Cloudflare D1 community schema additions.
+- **Prerequisite For**: None.
+- **Risks**: Spam and abuse in public collection titles/descriptions.
+- **Acceptance Criteria**: Users can publish curated collections with custom notes; community browse route with search.
+- **Testing Requirements**: D1 migration tests and moderation integration tests.
 
-2. **Metadata Corrections & Community Reviews**
-   - *User Value*: Crowdsource fixes for broken titles, missing authors, and incorrect covers.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: D1 moderation pipeline.
-   - *Risks*: Vandalism or spam.
-   - *Acceptance Criteria*: Logged-in/trusted contributors can submit metadata edits subject to admin moderation.
+#### P5.2 Community Metadata Corrections
+- **Problem**: Public domain or uploaded books often have incorrect titles, authors, or missing covers.
+- **User Value**: Crowdsourced accuracy for the collective book catalog.
+- **Technical Complexity**: **M**
+- **Dependencies**: D1 moderation pipeline.
+- **Prerequisite For**: None.
+- **Risks**: Vandalism or malicious metadata overwriting.
+- **Acceptance Criteria**: Contributors can propose edits; edits require admin review or trusted contributor status.
+- **Testing Requirements**: Audit log and rollback tests.
 
-3. **OPDS Feed Server**
-   - *User Value*: Connect third-party e-readers (KOReader, Moon+ Reader) directly to the user's Bookracy library.
-   - *Technical Complexity*: Medium.
-   - *Dependencies*: Cloudflare Worker OPDS endpoint.
-   - *Risks*: Authentication handling over OPDS.
-   - *Acceptance Criteria*: OPDS catalog endpoint authenticated with account key.
+#### P5.3 Authenticated OPDS Catalog Server
+- **Problem**: Readers cannot browse their Bookracy cloud library from external dedicated e-readers (KOReader, Moon+ Reader).
+- **User Value**: Access personal Bookracy books directly from dedicated e-ink hardware.
+- **Technical Complexity**: **M**
+- **Dependencies**: Backend Worker routing; user bearer authentication.
+- **Prerequisite For**: None.
+- **Risks**: Authentication leak over plaintext HTTP on older e-readers.
+- **Acceptance Criteria**: Serves OPDS XML catalog of saved bookmarks and uploads, authenticated via bearer token.
+- **Testing Requirements**: OPDS feed XML validation against KOReader client.
 
 ---
 
 ## 9. Recommended Technical Improvements
 
-1. **Implement Root-Level Build & Script Orchestration**
-   - Add a root `package.json` with pnpm workspaces or workspace scripts:
-     ```json
-     {
-       "name": "bookracy-monorepo",
-       "private": true,
-       "scripts": {
-         "build:converter": "pnpm --filter bookracy-convertor build",
-         "build:frontend": "pnpm --filter bookracy build",
-         "build:all": "pnpm --filter bookracy-convertor build && pnpm --filter bookracy build",
-         "test:all": "pnpm --filter bookracy-api test && pnpm --filter bookracy-convertor test",
-         "typecheck:all": "pnpm --filter bookracy-api typecheck && pnpm --filter bookracy-convertor build && pnpm --filter bookracy typecheck"
-       }
-     }
-     ```
-2. **Virtualize Large Lists in Frontend**
-   - Adopt `@tanstack/react-virtual` for offline library lists and download history when handling hundreds of records to prevent DOM bloat.
-3. **Decouple Reader from Specific Format Providers**
-   - Refactor `EpubReader` into a unified `ReaderModal` / `ReaderView` that routes based on file MIME type:
-     - `application/epub+zip` -> `EpubEngine`
-     - `application/pdf` -> `PdfEngine`
-     - `application/vnd.comicbook+zip` -> `ComicEngine`
-     - `text/plain` -> `TextEngine`
-   - Unify reading position state: `{ format, position: string | number, percentage: number }`.
-4. **Automated Frontend Testing**
-   - Introduce Playwright for browser integration and reader regression testing.
+1. **Root-Level Workspace Orchestration**:
+   Introduce a root `pnpm-workspace.yaml` and root `package.json` with coordinated build scripts:
+   ```yaml
+   packages:
+     - 'backend-worker'
+     - 'epub-converter'
+     - 'frontend'
+   ```
+2. **Unified Reader Engine Architecture**:
+   Refactor `EpubReader` into a decoupled reader harness (`ReaderShell`) with pluggable format engines:
+   - `EpubEngine` (`epubjs`)
+   - `PdfEngine` (`pdfjs-dist`)
+   - `ComicEngine` (Canvas / WebGL image archive renderer)
+   - `TextEngine` (Virtualized text renderer)
+   Normalize reading position into `{ format, cfiOrPage, percentage, timestamp }`.
+3. **DOM Virtualization for Offline Library**:
+   Implement `@tanstack/react-virtual` in `frontend/src/components/downloads/offline-library.tsx` to ensure smooth scrolling and low memory usage when displaying hundreds of downloaded books.
+4. **End-to-End Test Automation**:
+   Deploy Playwright test harness in `frontend` covering reader loading, page turning, offline library persistence, and sync workflows.
 
 ---
 
-## 10. Implementation Sequence & Milestones
+## 10. Implementation Sequence & Milestones (P0 through P5)
 
 ```
-+-------------------------------------------------------------+
-| Milestone 1 (Foundation): P0 Build & Upstream Hardening      |
-| - Root workspace build scripts                              |
-| - Upstream outage UX fallback notifications                 |
-| - Fast-refresh and lint warning cleanups                    |
-+------------------------------+------------------------------+
-                               |
-                               v
-+-------------------------------------------------------------+
-| Milestone 2 (Reading Core): P1 In-App PDF & Reader Upgrades  |
-| - Integrated PDF.js reader component                        |
-| - Reader annotations & highlight store                      |
-| - In-book search sheet                                      |
-+------------------------------+------------------------------+
-                               |
-                               v
-+-------------------------------------------------------------+
-| Milestone 3 (Library): P2 Personal Library Management       |
-| - Reading status triage (Want/Reading/Finished)             |
-| - Bulk import with batch progress                           |
-| - Local duplicate detection and metadata editor             |
-+------------------------------+------------------------------+
-                               |
-                               v
-+-------------------------------------------------------------+
-| Milestone 4 (Comics & Formats): P3 CBZ/CBR & Text Support    |
-| - Manga/comic canvas viewer with RTL support                |
-| - Plain text / Markdown reader                              |
-| - EPUB converter page-size configuration dialog             |
-+------------------------------+------------------------------+
-                               |
-                               v
-+-------------------------------------------------------------+
-| Milestone 5 (Intelligence): P4 AI Reading Assistant          |
-| - Privacy-first passage explanation                         |
-| - Chapter summarization pipeline                            |
-+-------------------------------------------------------------+
++-------------------------------------------------------------------------+
+| Milestone 1 (Foundation): P0 Build Orchestration & Safety               |
+| - Root workspace build & test scripts                                   |
+| - Upstream outage UX fallback alerts                                    |
+| - Server-side upload archive safety (ZIP bomb / traversal checks)       |
++------------------------------------+------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| Milestone 2 (Core Reading): P1 Multi-Format Reader & Annotations        |
+| - Embedded PDF.js reader with progress tracking                         |
+| - Text highlights, personal notes, and reader drawer                    |
+| - In-book full-text search & typography controls                        |
++------------------------------------+------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| Milestone 3 (Library): P2 Personal Library Management                   |
+| - Reading status triage (Want to Read / Currently Reading / Finished)   |
+| - Bulk folder import with batch queue                                   |
+| - Duplicate detection, metadata editor & DOM virtualization             |
++------------------------------------+------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| Milestone 4 (Comics & Formats): P3 Graphic Novels & Conversion          |
+| - CBZ/CBR manga/comic viewer with RTL & double-page modes               |
+| - Plain text / Markdown viewer                                          |
+| - EPUB-to-PDF configurable page geometry profiles                       |
++------------------------------------+------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| Milestone 5 (Intelligence): P4 AI Reading Assistant                     |
+| - Passage explanation & contextual vocabulary                           |
+| - Chapter summarization & study note generation                         |
+| - Cross-library semantic search prototype                               |
++------------------------------------+------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| Milestone 6 (Ecosystem): P5 Community & Integrations                    |
+| - Public community collections & shared booklists                       |
+| - Crowdsourced metadata correction pipeline                             |
+| - Authenticated OPDS catalog server for external e-readers              |
++-------------------------------------------------------------------------+
 ```
+
+### Detailed Milestone Specifications
+
+#### Milestone 1: P0 Foundation & Safety
+- **Objective**: Establish unified build infrastructure, upstream error transparency, and server-side upload safety.
+- **Deliverables**: Root workspace build scripts; frontend error status banner for upstream outages; server-side ZIP header validation in `handleUploadCreate`.
+- **Prerequisites**: None.
+- **Exit Criteria**: Clean clone builds with `pnpm run build` without manual sequence steps; 100% of existing backend and converter tests pass.
+- **Verification**: Clean clone verification; archive upload security integration tests.
+
+#### Milestone 2: P1 Core Reading Experience
+- **Objective**: Deliver in-app PDF reading and study annotation tools.
+- **Deliverables**: Embedded PDF.js reader component; highlight and note storage in IndexedDB; in-book search sheet.
+- **Prerequisites**: Milestone 1.
+- **Exit Criteria**: Users can read EPUBs and PDFs with saved reading positions; annotations persist across browser sessions.
+- **Verification**: Cross-format reading regression tests; mobile viewport testing.
+
+#### Milestone 3: P2 Personal Library Management
+- **Objective**: Enable seamless organization, bulk importing, and high-performance management for large libraries.
+- **Deliverables**: Reading status triage shelves; bulk file import modal; metadata editor; virtualized library grid.
+- **Prerequisites**: Milestone 2.
+- **Exit Criteria**: 2,000-book libraries render at 60fps; bulk imports handle 100+ files without browser crashes.
+- **Verification**: Benchmark rendering tests; duplicate detection unit tests.
+
+#### Milestone 4: P3 Advanced Formats & Conversion
+- **Objective**: Support graphic novels, plain text documents, and print-ready PDF generation.
+- **Deliverables**: CBZ/CBR manga reader with RTL support; text document viewer; configurable EPUB-to-PDF conversion dialog.
+- **Prerequisites**: Milestone 3.
+- **Exit Criteria**: Comic archives render smoothly with double-page spread support; custom PDF profiles match target dimensions.
+- **Verification**: Memory profiling on comic archive paging; PDF output geometry inspection.
+
+#### Milestone 5: P4 Bookracy AI Reading Assistant
+- **Objective**: Provide grounded reading comprehension and study tools.
+- **Deliverables**: Passage explanation popover; chapter summarizer; optional BYO-API key configuration in Settings.
+- **Prerequisites**: Milestone 2, Milestone 4.
+- **Exit Criteria**: AI responses cite exact source excerpts; zero user data sent to external AI without explicit consent.
+- **Verification**: Prompt grounding evaluation; privacy opt-in automated tests.
+
+#### Milestone 6: P5 Community & Ecosystem
+- **Objective**: Expand discovery, community curation, and external hardware connectivity.
+- **Deliverables**: Community public booklists; metadata edit review pipeline; OPDS feed endpoint.
+- **Prerequisites**: Milestone 3.
+- **Exit Criteria**: External e-readers (KOReader) connect and download books via OPDS; community collections display on community page.
+- **Verification**: OPDS feed validator; admin moderation integration tests.
 
 ---
 
 ## 11. Testing & Verification Strategy
 
-- **Unit Testing**:
-  - Backend Worker: Retain existing Node test suite (`148 tests`); expand tests for any new routing or schema changes.
-  - EPUB Converter: Retain Node/tsx test suite (`18 tests`); write tests for custom page sizing and margin parameters.
-- **Frontend Type & Lint Verification**:
-  - Automated `tsc --noEmit` and `eslint src/` checks run across all PRs.
-- **End-to-End Verification**:
-  - Playwright test suite for critical reader paths: opening EPUB, paging forward/backward, creating bookmarks, verifying IndexedDB storage retention offline.
-- **Offline Reliability Verification**:
-  - Simulate offline network conditions in browser devtools; confirm that downloaded books in IndexedDB load and render without network calls.
+### Existing Test Suites [Verified]
+- **Backend Worker**: 148 automated unit and integration tests executing via Node.js test runner (`backend-worker/tests/`).
+  - Covers LibGen search parsing, 5-mirror backoff, AA slow-download countdown extraction, chunked backup storage, FTS5 operator sanitization, and takedown sets.
+  - Executed and passing: `pnpm test` in `backend-worker`.
+- **EPUB Converter**: 18 automated unit tests executing via `tsx` and Node.js test runner (`epub-converter/tests/`).
+  - Covers multi-page PDF generation, line wrapping, font sniffing, outline bookmarks, fallback font rendering, and abort signals.
+  - Executed and passing: `pnpm test` in `epub-converter`.
+
+### Recommended Future Testing Strategy
+1. **Frontend Unit & Component Testing**:
+   - Introduce Vitest and React Testing Library for store logic (`progress.ts`, `bookmarks.ts`, `sync.ts`) and reader utility functions.
+2. **End-to-End Browser Testing**:
+   - Implement Playwright test suite for critical user flows:
+     - Search -> download -> open reader -> page turn -> save bookmark.
+     - Offline persistence: verify books in IndexedDB load and render when browser network is disabled.
+3. **Upload & Archive Security Testing**:
+   - Create automated test cases submitting malformed ZIPs, excessive compression ratios (ZIP bombs), and path traversal payloads to `handleUploadCreate`.
+4. **Large-Library Performance Testing**:
+   - Automated benchmark loading 2,000 synthetic books into IndexedDB and measuring scroll FPS and memory retention.
+5. **Accessibility Testing**:
+   - Axe-core automated accessibility audits covering color contrast, keyboard navigation, and ARIA attributes in reader modals.
 
 ---
 
@@ -484,18 +595,30 @@ bookracy/
 
 | Risk / Dependency | Impact | Probability | Mitigation Strategy |
 | :--- | :--- | :--- | :--- |
-| **Upstream Mirror Blocking / Anti-Bot** | High | High | Multi-mirror racing, Cloudflare FTS5 offline fallback cache, user-agent rotation, transparent user error messaging. |
-| **IndexedDB Quota Limits & Safari Eviction** | Medium | Medium | Proactive `navigator.storage.persist()` request on first save; storage meter alerting user of quota usage. |
-| **Large File Memory Spikes on Mobile** | High | Medium | Chunked streaming, Web Worker offloading for conversions and comic rendering, unvirtualized canvas management. |
-| **Cloudflare Worker D1 & KV Quotas** | Medium | Low | FTS query indexing, edge caching with Cache API, denormalized metadata storage. |
-| **Copyright & DMCA Ingest Risks** | Critical | Low | Maintain strict takedown MD5 sets, hash verification, administrative ban tools, zero unauthorized commercial distribution. |
+| **External Mirror Instability / Bot Challenges** | High | High | Multi-mirror racing, D1 FTS5 offline cache fallback, circuit breaking with exponential backoff, transparent UI degradation notices. |
+| **IndexedDB Quota & Safari Eviction** | Medium | Medium | Proactive `navigator.storage.persist()` on first save; storage meter alerting user of quota usage. |
+| **Archive Security & Malformed Payloads** | High | Medium | Server-side ZIP central directory validation; decompression ratio limits; MIME allowlisting. |
+| **Large File Memory Spikes on Mobile** | High | Medium | Web Worker offloading for conversions and comic rendering; image tiling; DOM virtualization. |
+| **Cloudflare Worker Execution Limits** | Medium | Low | Streaming bodies via `TransformStream`; offloading heavy background replication to Queues. |
+| **Copyright & DMCA Ingestion Risks** | Critical | Low | Maintain strict takedown MD5 sets, hash verification, administrative ban tools, zero commercial distribution. |
 
 ---
 
-## 13. Definition of Success
+## 13. Definition of Success (Proposed Product Targets)
 
-Bookracy achieves its architectural vision when:
-1. **Universal Reading**: Users can open and read EPUBs, PDFs, CBZ/CBR comics, and text documents in one unified, distraction-free interface with persistent progress across devices.
-2. **Reliable Anywhere**: The application functions seamlessly offline without network connectivity for all stored content.
-3. **Calibre-Grade Library Power**: Users can effortlessly organize, search, tag, and curate collections containing thousands of books.
-4. **Rock-Solid Stability**: Builds are deterministic, automated test suites pass across all subprojects, and edge failovers shield readers from external upstream outages.
+The following measurable targets represent **proposed product goals** for future development milestones, rather than current performance benchmarks:
+
+1. **Build & Development Reliability**:
+   - Clean-clone installation and build succeeds in a single root command (`pnpm run build`) in < 60 seconds without manual ordering steps.
+   - 100% TypeScript type check and linter passing with zero warnings across all subprojects.
+2. **Reader Responsiveness**:
+   - In-app EPUB, PDF, and comic readers open within < 1.0 second for cached books on desktop and modern mobile devices.
+   - Zero layout reflow or reading position loss when changing font size, theme, or screen orientation.
+3. **Offline Reliability**:
+   - 100% of books saved to IndexedDB remain readable with network connectivity disabled.
+   - Reading progress and annotations persist offline and reconcile automatically upon reconnecting.
+4. **Large-Library Scalability**:
+   - Offline library smoothly virtualizes collections containing 2,000+ documents, maintaining 60fps scrolling and memory usage under 150 MB.
+5. **Security & Data Integrity**:
+   - 100% of community uploads pass server-side MD5 integrity and archive safety checks.
+   - Zero sensitive sync data or admin keys leaked via client-side bundles or unauthenticated responses.
