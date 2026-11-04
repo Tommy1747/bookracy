@@ -1,0 +1,11 @@
+{
+  "name": "bookracy-monorepo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm --filter bookracy-convertor run build && pnpm --filter bookracy run build && pnpm --filter bookracy-api run typecheck",
+    "test": "pnpm --filter bookracy-convertor test && pnpm --filter bookracy-api test",
+    "typecheck": "pnpm --filter bookracy-convertor exec tsc -p tsconfig.build.json && pnpm --filter bookracy run typecheck && pnpm --filter bookracy-api run typecheck",
+    "lint": "pnpm --filter bookracy-convertor lint && pnpm --filter bookracy lint"
+  }
+}
