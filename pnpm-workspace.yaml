@@ -1,0 +1,9 @@
+packages:
+  - 'backend-worker'
+  - 'epub-converter'
+  - 'frontend'
+onlyBuiltDependencies:
+  - '@tailwindcss/oxide'
+  - 'esbuild'
+  - 'sharp'
+  - 'workerd'
