@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 interface SearchStatusBannerProps {
   source?: "live" | "cache" | "fts" | "public_domain" | "none";
   outage?: boolean;
+  partial?: boolean;
   message?: string;
   hasResults?: boolean;
   onRetry?: () => void;
@@ -13,6 +14,7 @@ interface SearchStatusBannerProps {
 export function SearchStatusBanner({
   source,
   outage,
+  partial,
   message,
   hasResults = true,
   onRetry,
@@ -126,7 +128,7 @@ export function SearchStatusBanner({
           <div>
             <span className="font-medium text-amber-500">Upstream search degraded.</span>{" "}
             <span className="text-muted-foreground">
-              External providers are currently unreachable. Showing available community uploads.
+              {message || "External providers are currently unreachable. Showing available community uploads."}
             </span>
           </div>
         </div>
@@ -140,6 +142,38 @@ export function SearchStatusBanner({
           >
             <RefreshCw className={`h-3.5 w-3.5 ${isRetrying ? "animate-spin" : ""}`} />
             Retry search
+          </Button>
+        )}
+      </div>
+    );
+  }
+
+  if (partial && hasResults) {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        className="flex items-center justify-between gap-3 rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-foreground"
+      >
+        <div className="flex items-center gap-3">
+          <AlertTriangle className="h-5 w-5 shrink-0 text-amber-500" />
+          <div>
+            <span className="font-medium text-amber-500">Partial search results.</span>{" "}
+            <span className="text-muted-foreground">
+              {message || "Some external search mirrors are experiencing delays. Showing available results."}
+            </span>
+          </div>
+        </div>
+        {onRetry && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onRetry}
+            disabled={isRetrying}
+            className="shrink-0 gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${isRetrying ? "animate-spin" : ""}`} />
+            Check mirrors
           </Button>
         )}
       </div>

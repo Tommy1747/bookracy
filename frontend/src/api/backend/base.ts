@@ -4,6 +4,7 @@ import { ofetch } from "ofetch";
 export type BaseResponse<T> = {
   results: T[];
   degraded?: boolean;
+  partial?: boolean;
   outage?: boolean;
   source?: "live" | "cache" | "fts" | "public_domain" | "none";
   upstreamNotice?: {

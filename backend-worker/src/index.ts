@@ -14,6 +14,8 @@ import {
   BACKGROUND_PROBE_STRIKES,
   acquireLock,
   fetchableAaMirrors,
+  classifyProviderStatus,
+  type ProviderRunMetrics,
 } from "./reliability";
 import { inCompletionOrder } from "./concurrency";
 import { resumableBody } from "./resumable";
@@ -835,6 +837,7 @@ export interface SearchResultOutcome {
   results: RawBook[];
   source: "live" | "cache" | "fts" | "public_domain" | "none";
   degraded: boolean;
+  partial?: boolean;
   upstreamOutage: boolean;
   upstreamNotice?: SearchNotice;
 }
@@ -908,31 +911,38 @@ async function searchSources(
     return results;
   };
 
-  let aaAttempted = 0;
-  let aaHealthyResponses = 0;
-  let aaChallenges = 0;
-  let aaFailures = 0;
+  const aaMirrors = await getAaMirrors(ctx);
+  const aaMetrics: ProviderRunMetrics = {
+    total: aaMirrors.length,
+    skipped: 0,
+    attempted: 0,
+    healthyResponses: 0,
+    challenges: 0,
+    failures: 0,
+  };
 
-  for (const base of await getAaMirrors(ctx)) {
-    if (await isMirrorDown(base)) continue; // circuit-broken, skip this pass
-    if (await deferProbe(base, base + path, ctx)) continue; // long dead — probe it off-request
-    aaAttempted++;
+  for (const base of aaMirrors) {
+    if (await isMirrorDown(base)) {
+      aaMetrics.skipped++;
+      continue;
+    }
+    if (await deferProbe(base, base + path, ctx)) {
+      aaMetrics.skipped++;
+      continue;
+    }
+    aaMetrics.attempted++;
     const html = await fetchTextTimed(base + path, UPSTREAM_SEARCH_TIMEOUT_MS);
     if (!html) {
-      // Timed out, refused, or non-2xx — all mean "don't send the next user here".
-      aaFailures++;
+      aaMetrics.failures++;
       await markMirrorDown(base);
       continue;
     }
-    // An anti-bot interstitial is a 200 full of HTML that parses to zero results, so
-    // without this check it looks exactly like "this mirror has no matches" and we'd
-    // stop trusting a host that's actually fine. Skip it without blaming the mirror.
     if (isAaChallengePage(html)) {
-      aaChallenges++;
+      aaMetrics.challenges++;
       continue;
     }
-    await markMirrorUp(base); // answered a real page — clear any accumulated backoff
-    aaHealthyResponses++;
+    await markMirrorUp(base);
+    aaMetrics.healthyResponses++;
 
     const results = parseSearchHtml(html);
     if (results.length) {
@@ -943,16 +953,86 @@ async function searchSources(
         upstreamOutage: false,
       };
     }
-    // Empty but readable: keep trying the other mirrors. AA's full-text search almost
-    // never returns nothing for a real query, so an empty page more likely means this
-    // host's index is degraded than that the book doesn't exist.
   }
 
   // Every AA mirror failed/returned nothing → fall back to a direct Library Genesis
   // search. Its md5s resolve on the exact same download path, so results stay usable.
-  // Filters/pagination differ upstream, so this only backstops the first page — enough
-  // to keep search alive during an AA outage without pretending to honour facets.
   if (page <= 1 && MD5_QUERY.test(query)) {
+    const lgMd5Metrics: ProviderRunMetrics = {
+      total: LIBGEN_MIRRORS.length,
+      skipped: 0,
+      attempted: 0,
+      healthyResponses: 0,
+      challenges: 0,
+      failures: 0,
+    };
+
+    let cleanMisses = 0;
+    for (const base of LIBGEN_MIRRORS) {
+      if (cleanMisses >= 2) break;
+      if (await isMirrorDown(base)) {
+        lgMd5Metrics.skipped++;
+        continue;
+      }
+      if (await deferProbe(base, `${base}/file.php?md5=${query}`, ctx)) {
+        lgMd5Metrics.skipped++;
+        continue;
+      }
+      lgMd5Metrics.attempted++;
+      const html = await fetchTextTimed(`${base}/file.php?md5=${query}`, UPSTREAM_SEARCH_TIMEOUT_MS);
+      const book = html ? parseLibgenFilePage(html, query) : null;
+      if (book) {
+        await markMirrorUp(base);
+        lgMd5Metrics.healthyResponses++;
+        const classification = classifyProviderStatus(aaMetrics, lgMd5Metrics);
+        return {
+          results: store([book]),
+          source: "live",
+          degraded: classification.partialFailure,
+          partial: classification.partialFailure,
+          upstreamOutage: false,
+          upstreamNotice: classification.partialFailure
+            ? {
+                code: "UPSTREAM_DEGRADED",
+                message: "Some external search mirrors are experiencing delays.",
+              }
+            : undefined,
+        };
+      }
+
+      const viaJson = await resolveViaLibgenJson(base, query);
+      if (viaJson) {
+        await markMirrorUp(base);
+        lgMd5Metrics.healthyResponses++;
+        const classification = classifyProviderStatus(aaMetrics, lgMd5Metrics);
+        return {
+          results: store([viaJson]),
+          source: "live",
+          degraded: classification.partialFailure,
+          partial: classification.partialFailure,
+          upstreamOutage: false,
+          upstreamNotice: classification.partialFailure
+            ? {
+                code: "UPSTREAM_DEGRADED",
+                message: "Some external search mirrors are experiencing delays.",
+              }
+            : undefined,
+        };
+      }
+
+      if (!html) {
+        lgMd5Metrics.failures++;
+        await markMirrorDown(base);
+        continue;
+      }
+      await markMirrorUp(base);
+      lgMd5Metrics.healthyResponses++;
+      cleanMisses++;
+    }
+
+    const classification = classifyProviderStatus(aaMetrics, lgMd5Metrics);
+
+    // If live lookup missed/failed, try local index before declaring an outage
     if (env) {
       const known = await searchIndex.findByMd5(env, query);
       if (known) {
@@ -960,83 +1040,62 @@ async function searchSources(
           results: [known],
           source: "fts",
           degraded: true,
-          upstreamOutage: false,
+          partial: classification.partialFailure,
+          upstreamOutage: classification.upstreamOutage,
           upstreamNotice: {
-            code: "UPSTREAM_DEGRADED",
-            message: "External search mirrors are currently experiencing delays. Showing saved library record.",
+            code: classification.upstreamOutage ? "UPSTREAM_DOWN" : "UPSTREAM_DEGRADED",
+            message: classification.upstreamOutage
+              ? "External search providers are temporarily unreachable. Showing saved library record."
+              : "Some external search mirrors are experiencing delays. Showing saved library record.",
           },
         };
       }
     }
 
-    let cleanMisses = 0;
-    let lgMd5Attempted = 0;
-    let lgMd5Failures = 0;
-
-    for (const base of LIBGEN_MIRRORS) {
-      if (cleanMisses >= 2) break;
-      if (await isMirrorDown(base)) continue;
-      if (await deferProbe(base, `${base}/file.php?md5=${query}`, ctx)) continue;
-      lgMd5Attempted++;
-      const html = await fetchTextTimed(`${base}/file.php?md5=${query}`, UPSTREAM_SEARCH_TIMEOUT_MS);
-      const book = html ? parseLibgenFilePage(html, query) : null;
-      if (book) {
-        await markMirrorUp(base);
-        return {
-          results: store([book]),
-          source: "live",
-          degraded: false,
-          upstreamOutage: false,
-        };
-      }
-
-      const viaJson = await resolveViaLibgenJson(base, query);
-      if (viaJson) {
-        await markMirrorUp(base);
-        return {
-          results: store([viaJson]),
-          source: "live",
-          degraded: false,
-          upstreamOutage: false,
-        };
-      }
-
-      if (!html) {
-        lgMd5Failures++;
-        await markMirrorDown(base);
-        continue;
-      }
-      await markMirrorUp(base);
-      cleanMisses++;
-    }
-
-    const md5Outage = (aaAttempted === 0 || aaFailures + aaChallenges === aaAttempted) && (lgMd5Attempted > 0 && lgMd5Failures === lgMd5Attempted);
     return {
       results: [],
       source: "none",
-      degraded: md5Outage,
-      upstreamOutage: md5Outage,
-      upstreamNotice: md5Outage
+      degraded: classification.upstreamOutage || classification.partialFailure,
+      partial: classification.partialFailure,
+      upstreamOutage: classification.upstreamOutage,
+      upstreamNotice: classification.upstreamOutage
         ? {
             code: "UPSTREAM_DOWN",
             message: "External book search mirrors are temporarily unreachable.",
           }
-        : undefined,
+        : classification.partialFailure
+          ? {
+              code: "UPSTREAM_DEGRADED",
+              message: "Some external search mirrors are experiencing delays.",
+            }
+          : undefined,
     };
   }
 
-  let lgAttempted = 0;
-  let lgCleanMisses = 0;
-  let lgFailures = 0;
+  const lgMetrics: ProviderRunMetrics = {
+    total: LIBGEN_MIRRORS.length,
+    skipped: 0,
+    attempted: 0,
+    healthyResponses: 0,
+    challenges: 0,
+    failures: 0,
+  };
 
   if (page <= 1) {
     const candidates: string[] = [];
     for (const base of LIBGEN_MIRRORS) {
-      if (await isMirrorDown(base)) continue;
-      if (await deferProbe(base, libgenSearchUrl(base, query), ctx)) continue;
+      if (await isMirrorDown(base)) {
+        lgMetrics.skipped++;
+        continue;
+      }
+      if (await deferProbe(base, libgenSearchUrl(base, query), ctx)) {
+        lgMetrics.skipped++;
+        continue;
+      }
       candidates.push(base);
     }
 
+    let lgCleanMisses = 0;
     const width = opts.raceLibgen ? LIBGEN_SEARCH_RACE_WIDTH : 1;
     for (let i = 0; i < candidates.length && lgCleanMisses < 2; i += width) {
       const wave = candidates.slice(i, i + width);
@@ -1046,28 +1105,37 @@ async function searchSources(
         html: await fetchTextTimed(libgenSearchUrl(base, query), UPSTREAM_SEARCH_TIMEOUT_MS, HEADERS, losers.signal),
       }));
       for await (const { base, html } of inCompletionOrder(attempts)) {
-        lgAttempted++;
+        lgMetrics.attempted++;
         if (!html) {
           if (!losers.signal.aborted) {
-            lgFailures++;
+            lgMetrics.failures++;
             await markMirrorDown(base);
           }
           continue;
         }
         if (isLibgenErrorPage(html)) {
-          lgFailures++;
+          lgMetrics.failures++;
           await markMirrorDown(base);
           continue;
         }
         await markMirrorUp(base);
+        lgMetrics.healthyResponses++;
         const results = parseLibgenSearch(html);
         if (results.length) {
           losers.abort();
+          const classification = classifyProviderStatus(aaMetrics, lgMetrics);
           return {
             results: store(results),
             source: "live",
-            degraded: false,
+            degraded: classification.partialFailure,
+            partial: classification.partialFailure,
             upstreamOutage: false,
+            upstreamNotice: classification.partialFailure
+              ? {
+                  code: "UPSTREAM_DEGRADED",
+                  message: "Some external search mirrors are experiencing delays.",
+                }
+              : undefined,
           };
         }
         lgCleanMisses++;
@@ -1078,13 +1146,7 @@ async function searchSources(
       }
     }
 
-    // Upstream outage determination:
-    // Did AA fail completely (or have all mirrors down / challenged / unreachables)?
-    // Did LibGen also fail completely without any confirmed clean misses?
-    const aaUnavailable = (aaAttempted > 0 && aaHealthyResponses === 0) || (aaAttempted === 0);
-    const lgUnavailable = (candidates.length === 0) || (lgAttempted > 0 && lgCleanMisses === 0 && lgFailures > 0);
-    const upstreamOutage = aaUnavailable && lgUnavailable;
-    const partialFailure = (aaAttempted > 0 && aaHealthyResponses === 0) || (candidates.length === 0 || lgFailures > 0);
+    const classification = classifyProviderStatus(aaMetrics, lgMetrics);
 
     // Ask our own index before public-domain sources.
     // CACHE SAFETY INVARIANT: FTS5 fallback results are NOT written to the 30-minute
@@ -1097,10 +1159,11 @@ async function searchSources(
           results: remembered,
           source: "fts",
           degraded: true,
-          upstreamOutage,
+          partial: classification.partialFailure,
+          upstreamOutage: classification.upstreamOutage,
           upstreamNotice: {
-            code: upstreamOutage ? "UPSTREAM_DOWN" : "UPSTREAM_DEGRADED",
-            message: upstreamOutage
+            code: classification.upstreamOutage ? "UPSTREAM_DOWN" : "UPSTREAM_DEGRADED",
+            message: classification.upstreamOutage
               ? "External search providers are temporarily unreachable. Showing saved library index."
               : "Some external search mirrors are experiencing delays. Showing saved library index.",
           },
@@ -1116,10 +1179,11 @@ async function searchSources(
         results: pd,
         source: "public_domain",
         degraded: true,
-        upstreamOutage,
+        partial: classification.partialFailure,
+        upstreamOutage: classification.upstreamOutage,
         upstreamNotice: {
-          code: upstreamOutage ? "UPSTREAM_DOWN" : "UPSTREAM_DEGRADED",
-          message: upstreamOutage
+          code: classification.upstreamOutage ? "UPSTREAM_DOWN" : "UPSTREAM_DEGRADED",
+          message: classification.upstreamOutage
             ? "External search providers are temporarily unreachable. Showing public-domain catalog results."
             : "Some external search mirrors are experiencing delays. Showing public-domain catalog results.",
         },
@@ -1129,11 +1193,12 @@ async function searchSources(
     // Both live providers, FTS5, and PD returned nothing.
     // If upstream genuinely answered with clean misses, this is a legitimate empty search (not an outage).
     // If upstream failed/errored without clean misses, it is an outage.
-    if (upstreamOutage) {
+    if (classification.upstreamOutage) {
       return {
         results: [],
         source: "none",
         degraded: true,
+        partial: false,
         upstreamOutage: true,
         upstreamNotice: {
           code: "UPSTREAM_DOWN",
@@ -1145,9 +1210,10 @@ async function searchSources(
     return {
       results: [],
       source: "live",
-      degraded: partialFailure,
+      degraded: classification.partialFailure,
+      partial: classification.partialFailure,
       upstreamOutage: false,
-      upstreamNotice: partialFailure
+      upstreamNotice: classification.partialFailure
         ? {
             code: "UPSTREAM_DEGRADED",
             message: "Some external search mirrors experienced delays.",
@@ -1157,13 +1223,21 @@ async function searchSources(
   }
 
   // page > 1: AA was the only source that supported pagination.
-  const aaFailed = aaAttempted > 0 && aaHealthyResponses === 0;
+  const aaClassification = classifyProviderStatus(aaMetrics, {
+    total: 0,
+    skipped: 0,
+    attempted: 0,
+    healthyResponses: 0,
+    challenges: 0,
+    failures: 0,
+  });
   return {
     results: [],
     source: "none",
-    degraded: aaFailed,
-    upstreamOutage: aaFailed,
-    upstreamNotice: aaFailed
+    degraded: aaClassification.aaUnavailable,
+    partial: false,
+    upstreamOutage: aaClassification.aaUnavailable,
+    upstreamNotice: aaClassification.aaUnavailable
       ? {
           code: "UPSTREAM_DOWN",
           message: "External search provider is temporarily unreachable.",
@@ -1347,10 +1421,12 @@ async function handleSearch(url: URL, origin: string, env: Env, ctx: ExecutionCo
   // When community items exist but upstream suffered an outage or degradation
   const degraded = searchOutcome.degraded || (communityItems.length > 0 && searchOutcome.upstreamOutage);
   const outage = searchOutcome.upstreamOutage;
+  const partial = Boolean(searchOutcome.partial);
 
   return json({
     results: merged,
     degraded,
+    partial,
     outage,
     source: searchOutcome.source,
     ...(searchOutcome.upstreamNotice ? { upstreamNotice: searchOutcome.upstreamNotice } : {}),

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isLibgenErrorPage, isAaChallengePage } from "../src/parse.ts";
+import { classifyProviderStatus } from "../src/reliability.ts";
 
 test("isAaChallengePage correctly identifies anti-bot challenges", () => {
   const challengeRedirecting = "<html><head><title>Redirecting...</title></head><body>Please wait...</body></html>";
@@ -26,72 +27,68 @@ test("isLibgenErrorPage correctly identifies LibGen search daemon errors", () =>
   assert.equal(isLibgenErrorPage(cleanMissLibgen), false);
 });
 
-test("upstream outage logic distinguishes clean misses from total failure", () => {
-  // Classification simulation logic matching searchSources in index.ts:
-  const classifyOutage = (params: {
-    aaAttempted: number;
-    aaHealthyResponses: number;
-    libgenCandidates: number;
-    lgAttempted: number;
-    lgCleanMisses: number;
-    lgFailures: number;
-  }) => {
-    const aaUnavailable = (params.aaAttempted > 0 && params.aaHealthyResponses === 0) || (params.aaAttempted === 0);
-    const lgUnavailable = (params.libgenCandidates === 0) || (params.lgAttempted > 0 && params.lgCleanMisses === 0 && params.lgFailures > 0);
-    const upstreamOutage = aaUnavailable && lgUnavailable;
-    return upstreamOutage;
-  };
-
-  // Case 1: AA down (interstitial/challenge) + LibGen all mirrors timing out/5xx
-  assert.equal(
-    classifyOutage({
-      aaAttempted: 3,
-      aaHealthyResponses: 0,
-      libgenCandidates: 2,
-      lgAttempted: 2,
-      lgCleanMisses: 0,
-      lgFailures: 2,
-    }),
-    true,
-    "Should identify total provider outage when both AA and LibGen fail"
+test("classifyProviderStatus: both providers unavailable (challenges / errors / timeouts)", () => {
+  const res = classifyProviderStatus(
+    { total: 3, skipped: 0, attempted: 3, healthyResponses: 0, challenges: 2, failures: 1 },
+    { total: 5, skipped: 0, attempted: 2, healthyResponses: 0, challenges: 0, failures: 2 }
   );
+  assert.equal(res.aaUnavailable, true);
+  assert.equal(res.lgUnavailable, true);
+  assert.equal(res.upstreamOutage, true);
+  assert.equal(res.partialFailure, false);
+});
 
-  // Case 2: AA down, but LibGen answered healthy with clean misses (genuine zero-result search)
-  assert.equal(
-    classifyOutage({
-      aaAttempted: 3,
-      aaHealthyResponses: 0,
-      libgenCandidates: 2,
-      lgAttempted: 2,
-      lgCleanMisses: 2,
-      lgFailures: 0,
-    }),
-    false,
-    "A clean miss from LibGen must not be classified as a provider outage"
+test("classifyProviderStatus: all mirrors circuit-broken or deferred", () => {
+  const res = classifyProviderStatus(
+    { total: 3, skipped: 3, attempted: 0, healthyResponses: 0, challenges: 0, failures: 0 },
+    { total: 5, skipped: 5, attempted: 0, healthyResponses: 0, challenges: 0, failures: 0 }
   );
+  assert.equal(res.aaUnavailable, true);
+  assert.equal(res.lgUnavailable, true);
+  assert.equal(res.upstreamOutage, true);
+  assert.equal(res.partialFailure, false);
+});
 
-  // Case 3: All AA and LibGen mirrors circuit-broken or deferred
-  assert.equal(
-    classifyOutage({
-      aaAttempted: 0,
-      aaHealthyResponses: 0,
-      libgenCandidates: 0,
-      lgAttempted: 0,
-      lgCleanMisses: 0,
-      lgFailures: 0,
-    }),
-    true,
-    "When all upstream candidates are circuit-broken, state is an outage"
+test("classifyProviderStatus: one provider unavailable and another healthy with clean misses", () => {
+  // AA down (3 challenges), LibGen healthy with 2 clean misses
+  const res = classifyProviderStatus(
+    { total: 3, skipped: 0, attempted: 3, healthyResponses: 0, challenges: 3, failures: 0 },
+    { total: 5, skipped: 0, attempted: 2, healthyResponses: 2, challenges: 0, failures: 0 }
   );
+  assert.equal(res.aaUnavailable, true);
+  assert.equal(res.lgUnavailable, false);
+  assert.equal(res.upstreamOutage, false, "Must not be classified as total outage when LibGen answered cleanly");
+  assert.equal(res.partialFailure, true, "Should signal partial degradation because AA had challenges");
+});
+
+test("classifyProviderStatus: genuine clean miss when both providers are healthy", () => {
+  const res = classifyProviderStatus(
+    { total: 3, skipped: 0, attempted: 1, healthyResponses: 1, challenges: 0, failures: 0 },
+    { total: 5, skipped: 0, attempted: 2, healthyResponses: 2, challenges: 0, failures: 0 }
+  );
+  assert.equal(res.aaUnavailable, false);
+  assert.equal(res.lgUnavailable, false);
+  assert.equal(res.upstreamOutage, false);
+  assert.equal(res.partialFailure, false);
+});
+
+test("classifyProviderStatus: partial provider failure when some mirrors fail but hits exist", () => {
+  const res = classifyProviderStatus(
+    { total: 3, skipped: 1, attempted: 2, healthyResponses: 1, challenges: 0, failures: 1 },
+    { total: 5, skipped: 0, attempted: 2, healthyResponses: 2, challenges: 0, failures: 0 }
+  );
+  assert.equal(res.aaUnavailable, false);
+  assert.equal(res.lgUnavailable, false);
+  assert.equal(res.upstreamOutage, false);
+  assert.equal(res.partialFailure, true);
 });
 
 test("search response degradation envelope preserves community uploads during outage", () => {
-  // Verifies the response shaping rule:
-  // Community items must be retained and flagged with outage/degraded when upstream failed
   const searchOutcome = {
     results: [],
     source: "none" as const,
     degraded: true,
+    partial: false,
     upstreamOutage: true,
     upstreamNotice: {
       code: "UPSTREAM_DOWN" as const,
@@ -109,13 +106,14 @@ test("search response degradation envelope preserves community uploads during ou
   ];
 
   const merged = [...communityItems, ...searchOutcome.results];
-
   const degraded = searchOutcome.degraded || (communityItems.length > 0 && searchOutcome.upstreamOutage);
   const outage = searchOutcome.upstreamOutage;
+  const partial = Boolean(searchOutcome.partial);
 
   const responsePayload = {
     results: merged,
     degraded,
+    partial,
     outage,
     source: searchOutcome.source,
     upstreamNotice: searchOutcome.upstreamNotice,
@@ -124,5 +122,6 @@ test("search response degradation envelope preserves community uploads during ou
   assert.equal(responsePayload.results.length, 1);
   assert.equal(responsePayload.degraded, true);
   assert.equal(responsePayload.outage, true);
+  assert.equal(responsePayload.results[0].community, true);
   assert.equal(responsePayload.upstreamNotice.code, "UPSTREAM_DOWN");
 });

@@ -221,6 +221,66 @@ export async function setCachedSearch(upstreamPath: string, rows: unknown[]): Pr
  * Extract every `https://annas-archive.<tld>` clearnet host from arbitrary HTML.
  * Dedupes, keeps insertion order, ignores tor/i2p (they wouldn't work from a Worker).
  */
+export interface ProviderRunMetrics {
+  total: number;
+  skipped: number; // circuit-broken or deferred
+  attempted: number;
+  healthyResponses: number; // returned parseable page (hits or clean miss)
+  challenges: number; // anti-bot or interstitial
+  failures: number; // timeout, network error, 5xx, or daemon error
+}
+
+export interface ProviderClassification {
+  upstreamOutage: boolean;
+  partialFailure: boolean;
+  aaUnavailable: boolean;
+  lgUnavailable: boolean;
+}
+
+/**
+ * Pure function to classify search provider health across Anna's Archive and LibGen.
+ *
+ * Rules:
+ * - A provider is UNAVAILABLE if every one of its configured mirrors was either skipped
+ *   (circuit-broken / deferred) or attempted and failed (challenge / 5xx / timeout / error)
+ *   with ZERO healthy responses.
+ * - An unattempted provider or mirror is never assumed healthy.
+ * - A provider that returned a healthy clean miss is NOT unavailable (the book simply isn't in its index).
+ * - Complete upstream outage occurs iff BOTH providers are unavailable.
+ * - Partial failure occurs when at least one mirror experienced a failure or one provider is unavailable,
+ *   while not meeting the threshold for a complete outage.
+ */
+export function classifyProviderStatus(
+  aa: ProviderRunMetrics,
+  lg: ProviderRunMetrics,
+): ProviderClassification {
+  // AA availability:
+  // If no mirrors exist, or all mirrors were skipped/failed with 0 healthy responses:
+  const aaUnavailable =
+    aa.total === 0 ||
+    (aa.healthyResponses === 0 && (aa.skipped + aa.failures + aa.challenges >= aa.total));
+
+  // LibGen availability:
+  // LibGen races 2 mirrors at a time. If all candidates were skipped, or if LibGen was attempted
+  // and every attempt failed (0 healthy responses and failures > 0), LibGen is unavailable.
+  const lgUnavailable =
+    lg.total === 0 ||
+    (lg.healthyResponses === 0 && (lg.skipped >= lg.total || (lg.attempted > 0 && lg.failures >= lg.attempted)));
+
+  const upstreamOutage = aaUnavailable && lgUnavailable;
+
+  const aaHadIssue = aa.skipped > 0 || aa.failures > 0 || aa.challenges > 0;
+  const lgHadIssue = lg.skipped > 0 || lg.failures > 0 || lg.challenges > 0;
+  const partialFailure = !upstreamOutage && (aaHadIssue || lgHadIssue);
+
+  return {
+    upstreamOutage,
+    partialFailure,
+    aaUnavailable,
+    lgUnavailable,
+  };
+}
+
 export function extractAaHostsFromHtml(html: string): string[] {
   const seen = new Set<string>();
   const out: string[] = [];

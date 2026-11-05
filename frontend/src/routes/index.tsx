@@ -106,6 +106,7 @@ function Index() {
   // a repeat on page 2 would otherwise render twice (and warn about duplicate keys).
   const firstPage = infiniteData?.pages[0];
   const isDegraded = Boolean(firstPage?.degraded);
+  const isPartial = Boolean(firstPage?.partial);
   const isOutage = Boolean(firstPage?.outage);
   const resultSource = firstPage?.source;
   const degradationNotice = firstPage?.upstreamNotice?.message || firstPage?.message;
@@ -229,10 +230,11 @@ function Index() {
               </div>
             )}
 
-            {!isSearching && (isDegraded || isOutage) && (
+            {!isSearching && (isDegraded || isOutage || isPartial) && (
               <SearchStatusBanner
                 source={resultSource}
                 outage={isOutage}
+                partial={isPartial}
                 message={degradationNotice}
                 hasResults={allResults.length > 0}
                 onRetry={() => refetchSearch()}
