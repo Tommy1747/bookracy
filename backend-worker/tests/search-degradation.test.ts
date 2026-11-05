@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isLibgenErrorPage, isAaChallengePage } from "../src/parse.ts";
-import { classifyProviderStatus } from "../src/reliability.ts";
+import { classifyProviderStatus, buildSearchResponsePayload } from "../src/reliability.ts";
 
 test("isAaChallengePage correctly identifies anti-bot challenges", () => {
   const challengeRedirecting = "<html><head><title>Redirecting...</title></head><body>Please wait...</body></html>";
@@ -83,9 +83,53 @@ test("classifyProviderStatus: partial provider failure when some mirrors fail bu
   assert.equal(res.partialFailure, true);
 });
 
-test("search response degradation envelope preserves community uploads during outage", () => {
+test("MD5 resolution: LibGen daemon-error HTML is classified as failure rather than clean miss", () => {
+  const daemonErrorHtml = "<body>Could not connect to the database 9306. Too many connections</body>";
+  assert.equal(isLibgenErrorPage(daemonErrorHtml), true);
+
+  // If LibGen answered with this error on all attempts and AA failed/skipped:
+  const res = classifyProviderStatus(
+    { total: 3, skipped: 3, attempted: 0, healthyResponses: 0, challenges: 0, failures: 0 },
+    { total: 5, skipped: 0, attempted: 1, healthyResponses: 0, challenges: 0, failures: 1 }
+  );
+  assert.equal(res.lgUnavailable, true);
+  assert.equal(res.upstreamOutage, true);
+});
+
+test("MD5 resolution: healthy clean miss avoids outage classification", () => {
+  const cleanMissHtml = "<html><body>No file record for md5</body></html>";
+  assert.equal(isLibgenErrorPage(cleanMissHtml), false);
+
+  const res = classifyProviderStatus(
+    { total: 3, skipped: 3, attempted: 0, healthyResponses: 0, challenges: 0, failures: 0 },
+    { total: 5, skipped: 0, attempted: 2, healthyResponses: 2, challenges: 0, failures: 0 }
+  );
+  assert.equal(res.lgUnavailable, false);
+  assert.equal(res.upstreamOutage, false);
+  assert.equal(res.partialFailure, true); // AA was skipped
+});
+
+test("MD5 resolution: timeout on all candidates results in upstream outage", () => {
+  const res = classifyProviderStatus(
+    { total: 3, skipped: 0, attempted: 3, healthyResponses: 0, challenges: 0, failures: 3 },
+    { total: 5, skipped: 0, attempted: 5, healthyResponses: 0, challenges: 0, failures: 5 }
+  );
+  assert.equal(res.upstreamOutage, true);
+  assert.equal(res.aaUnavailable, true);
+  assert.equal(res.lgUnavailable, true);
+});
+
+test("MD5 resolution: successful resolution when one provider is unavailable", () => {
+  const res = classifyProviderStatus(
+    { total: 3, skipped: 3, attempted: 0, healthyResponses: 0, challenges: 0, failures: 0 },
+    { total: 5, skipped: 0, attempted: 1, healthyResponses: 1, challenges: 0, failures: 0 }
+  );
+  assert.equal(res.upstreamOutage, false);
+  assert.equal(res.partialFailure, true);
+});
+
+test("buildSearchResponsePayload: complete upstream outage with community results", () => {
   const searchOutcome = {
-    results: [],
     source: "none" as const,
     degraded: true,
     partial: false,
@@ -96,32 +140,73 @@ test("search response degradation envelope preserves community uploads during ou
     },
   };
 
-  const communityItems = [
-    {
-      md5: "a".repeat(32),
-      title: "Community Shared Book",
-      author: "Jane Doe",
-      community: true,
-    },
-  ];
+  const communityItem = { md5: "c".repeat(32), title: "Community Book", community: true };
+  const payload = buildSearchResponsePayload(searchOutcome, [communityItem], []);
 
-  const merged = [...communityItems, ...searchOutcome.results];
-  const degraded = searchOutcome.degraded || (communityItems.length > 0 && searchOutcome.upstreamOutage);
-  const outage = searchOutcome.upstreamOutage;
-  const partial = Boolean(searchOutcome.partial);
+  assert.equal(payload.results.length, 1);
+  assert.equal(payload.results[0].community, true);
+  assert.equal(payload.outage, true);
+  assert.equal(payload.degraded, true);
+  assert.equal(payload.upstreamNotice?.code, "UPSTREAM_DOWN");
+});
 
-  const responsePayload = {
-    results: merged,
-    degraded,
-    partial,
-    outage,
-    source: searchOutcome.source,
-    upstreamNotice: searchOutcome.upstreamNotice,
+test("buildSearchResponsePayload: complete upstream outage without community results", () => {
+  const searchOutcome = {
+    source: "none" as const,
+    degraded: true,
+    partial: false,
+    upstreamOutage: true,
   };
 
-  assert.equal(responsePayload.results.length, 1);
-  assert.equal(responsePayload.degraded, true);
-  assert.equal(responsePayload.outage, true);
-  assert.equal(responsePayload.results[0].community, true);
-  assert.equal(responsePayload.upstreamNotice.code, "UPSTREAM_DOWN");
+  const payload = buildSearchResponsePayload(searchOutcome, [], []);
+
+  assert.equal(payload.results.length, 0);
+  assert.equal(payload.outage, true);
+  assert.equal(payload.degraded, true);
+  assert.equal(payload.upstreamNotice?.code, "UPSTREAM_DOWN");
+});
+
+test("buildSearchResponsePayload: partial degradation with community and upstream results", () => {
+  const searchOutcome = {
+    source: "live" as const,
+    degraded: true,
+    partial: true,
+    upstreamOutage: false,
+    upstreamNotice: {
+      code: "UPSTREAM_DEGRADED" as const,
+      message: "Some external search mirrors are experiencing delays.",
+    },
+  };
+
+  const communityItem = { md5: "1".repeat(32), title: "User Upload", community: true };
+  const upstreamItem = { md5: "2".repeat(32), title: "Live Provider Book" };
+
+  const payload = buildSearchResponsePayload(searchOutcome, [communityItem], [upstreamItem]);
+
+  assert.equal(payload.results.length, 2);
+  assert.equal(payload.partial, true);
+  assert.equal(payload.degraded, true);
+  assert.equal(payload.outage, false);
+  assert.equal(payload.upstreamNotice?.code, "UPSTREAM_DEGRADED");
+});
+
+test("buildSearchResponsePayload: dedupes community and upstream results by md5", () => {
+  const searchOutcome = {
+    source: "live" as const,
+    degraded: false,
+    partial: false,
+    upstreamOutage: false,
+  };
+
+  const sharedMd5 = "d".repeat(32);
+  const communityItem = { md5: sharedMd5, title: "Community Priority", community: true };
+  const upstreamItem = { md5: sharedMd5, title: "Upstream Duplicate" };
+
+  const payload = buildSearchResponsePayload(searchOutcome, [communityItem], [upstreamItem]);
+
+  assert.equal(payload.results.length, 1);
+  assert.equal(payload.results[0].title, "Community Priority");
+  assert.equal(payload.results[0].community, true);
+  assert.equal(payload.outage, false);
+  assert.equal(payload.degraded, false);
 });

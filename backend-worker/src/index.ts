@@ -16,6 +16,9 @@ import {
   fetchableAaMirrors,
   classifyProviderStatus,
   type ProviderRunMetrics,
+  buildSearchResponsePayload,
+  type SearchNotice,
+  type SearchResponsePayload,
 } from "./reliability";
 import { inCompletionOrder } from "./concurrency";
 import { resumableBody } from "./resumable";
@@ -828,11 +831,6 @@ interface SearchOptions {
   raceLibgen?: boolean;
 }
 
-export interface SearchNotice {
-  code: "UPSTREAM_DOWN" | "UPSTREAM_DEGRADED";
-  message: string;
-}
-
 export interface SearchResultOutcome {
   results: RawBook[];
   source: "live" | "cache" | "fts" | "public_domain" | "none";
@@ -1025,6 +1023,13 @@ async function searchSources(
         await markMirrorDown(base);
         continue;
       }
+
+      if (isLibgenErrorPage(html)) {
+        lgMd5Metrics.failures++;
+        await markMirrorDown(base);
+        continue;
+      }
+
       await markMirrorUp(base);
       lgMd5Metrics.healthyResponses++;
       cleanMisses++;
@@ -1036,18 +1041,24 @@ async function searchSources(
     if (env) {
       const known = await searchIndex.findByMd5(env, query);
       if (known) {
+        const isDegraded = classification.upstreamOutage || classification.partialFailure;
         return {
           results: [known],
           source: "fts",
-          degraded: true,
+          degraded: isDegraded,
           partial: classification.partialFailure,
           upstreamOutage: classification.upstreamOutage,
-          upstreamNotice: {
-            code: classification.upstreamOutage ? "UPSTREAM_DOWN" : "UPSTREAM_DEGRADED",
-            message: classification.upstreamOutage
-              ? "External search providers are temporarily unreachable. Showing saved library record."
-              : "Some external search mirrors are experiencing delays. Showing saved library record.",
-          },
+          upstreamNotice: classification.upstreamOutage
+            ? {
+                code: "UPSTREAM_DOWN",
+                message: "External search providers are temporarily unreachable. Showing saved library record.",
+              }
+            : classification.partialFailure
+              ? {
+                  code: "UPSTREAM_DEGRADED",
+                  message: "Some external search mirrors are experiencing delays. Showing saved library record.",
+                }
+              : undefined,
         };
       }
     }
@@ -1155,18 +1166,24 @@ async function searchSources(
     if (env) {
       const remembered = await searchIndex.findByQuery(env, query, PD_SOURCE_LIMIT * 4);
       if (remembered.length) {
+        const isDegraded = classification.upstreamOutage || classification.partialFailure;
         return {
           results: remembered,
           source: "fts",
-          degraded: true,
+          degraded: isDegraded,
           partial: classification.partialFailure,
           upstreamOutage: classification.upstreamOutage,
-          upstreamNotice: {
-            code: classification.upstreamOutage ? "UPSTREAM_DOWN" : "UPSTREAM_DEGRADED",
-            message: classification.upstreamOutage
-              ? "External search providers are temporarily unreachable. Showing saved library index."
-              : "Some external search mirrors are experiencing delays. Showing saved library index.",
-          },
+          upstreamNotice: classification.upstreamOutage
+            ? {
+                code: "UPSTREAM_DOWN",
+                message: "External search providers are temporarily unreachable. Showing saved library index.",
+              }
+            : classification.partialFailure
+              ? {
+                  code: "UPSTREAM_DEGRADED",
+                  message: "Some external search mirrors are experiencing delays. Showing saved library index.",
+                }
+              : undefined,
         };
       }
     }
@@ -1175,18 +1192,24 @@ async function searchSources(
     // CACHE SAFETY: Do not cache degraded public-domain results as ordinary healthy search results.
     const pd = await searchPublicDomain(query);
     if (pd.length) {
+      const isDegraded = classification.upstreamOutage || classification.partialFailure;
       return {
         results: pd,
         source: "public_domain",
-        degraded: true,
+        degraded: isDegraded,
         partial: classification.partialFailure,
         upstreamOutage: classification.upstreamOutage,
-        upstreamNotice: {
-          code: classification.upstreamOutage ? "UPSTREAM_DOWN" : "UPSTREAM_DEGRADED",
-          message: classification.upstreamOutage
-            ? "External search providers are temporarily unreachable. Showing public-domain catalog results."
-            : "Some external search mirrors are experiencing delays. Showing public-domain catalog results.",
-        },
+        upstreamNotice: classification.upstreamOutage
+          ? {
+              code: "UPSTREAM_DOWN",
+              message: "External search providers are temporarily unreachable. Showing public-domain catalog results.",
+            }
+          : classification.partialFailure
+            ? {
+                code: "UPSTREAM_DEGRADED",
+                message: "Some external search mirrors are experiencing delays. Showing public-domain catalog results.",
+              }
+            : undefined,
       };
     }
 
@@ -1395,42 +1418,13 @@ async function handleSearch(url: URL, origin: string, env: Env, ctx: ExecutionCo
   // with community:true so the frontend can mark them "User upload").
   const matches = (communityLookup ? await communityLookup : []).filter((c) => !takedown.isTakenDown(c.md5, c.title, c.author));
   const communityItems = matches.map((c) => ({ ...communityToBookItem(c, origin), community: true }));
-  const seen = new Set(communityItems.map((c) => c.md5));
-  const merged = [...communityItems, ...results.filter((r) => !seen.has(r.md5)).map((r) => toBookItem(r, origin))];
+  const upstreamItems = results.map((r) => toBookItem(r, origin));
 
-  // Upstream outage without any results (neither community nor fallback)
-  if (!merged.length) {
-    if (searchOutcome.upstreamOutage) {
-      return json(
-        {
-          results: [],
-          degraded: true,
-          outage: true,
-          source: searchOutcome.source,
-          upstreamNotice: searchOutcome.upstreamNotice || {
-            code: "UPSTREAM_DOWN",
-            message: "External search providers are temporarily unreachable. No saved matches found.",
-          },
-        },
-        200,
-      );
-    }
+  const payload = buildSearchResponsePayload(searchOutcome, communityItems, upstreamItems);
+  if (!payload.results.length && !payload.outage) {
     return json({ message: "No results found" }, 404);
   }
-
-  // When community items exist but upstream suffered an outage or degradation
-  const degraded = searchOutcome.degraded || (communityItems.length > 0 && searchOutcome.upstreamOutage);
-  const outage = searchOutcome.upstreamOutage;
-  const partial = Boolean(searchOutcome.partial);
-
-  return json({
-    results: merged,
-    degraded,
-    partial,
-    outage,
-    source: searchOutcome.source,
-    ...(searchOutcome.upstreamNotice ? { upstreamNotice: searchOutcome.upstreamNotice } : {}),
-  });
+  return json(payload, 200);
 }
 
 // Titles to put on the homepage shelf, newest bestsellers first. Live from the Apple

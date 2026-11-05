@@ -281,6 +281,63 @@ export function classifyProviderStatus(
   };
 }
 
+export interface SearchNotice {
+  code: "UPSTREAM_DOWN" | "UPSTREAM_DEGRADED";
+  message: string;
+}
+
+export interface SearchOutcomeMetadata {
+  source: "live" | "cache" | "fts" | "public_domain" | "none";
+  degraded: boolean;
+  partial?: boolean;
+  upstreamOutage: boolean;
+  upstreamNotice?: SearchNotice;
+}
+
+export interface SearchResponsePayload<T> {
+  results: T[];
+  degraded: boolean;
+  partial: boolean;
+  outage: boolean;
+  source: "live" | "cache" | "fts" | "public_domain" | "none";
+  upstreamNotice?: SearchNotice;
+}
+
+/**
+ * Builds the search API response payload by merging community uploads with upstream results,
+ * deduplicating by md5, preserving degradation and outage signaling, and attaching user-safe notices.
+ */
+export function buildSearchResponsePayload<T extends { md5: string }>(
+  searchOutcome: SearchOutcomeMetadata,
+  communityItems: T[],
+  upstreamItems: T[],
+): SearchResponsePayload<T> {
+  const seen = new Set(communityItems.map((c) => c.md5));
+  const merged = [...communityItems, ...upstreamItems.filter((r) => !seen.has(r.md5))];
+
+  const degraded = searchOutcome.degraded || (communityItems.length > 0 && searchOutcome.upstreamOutage);
+  const outage = searchOutcome.upstreamOutage;
+  const partial = Boolean(searchOutcome.partial);
+
+  return {
+    results: merged,
+    degraded,
+    partial,
+    outage,
+    source: searchOutcome.source,
+    ...(searchOutcome.upstreamNotice
+      ? { upstreamNotice: searchOutcome.upstreamNotice }
+      : outage
+        ? {
+            upstreamNotice: {
+              code: "UPSTREAM_DOWN",
+              message: "External search providers are temporarily unreachable. No saved matches found.",
+            },
+          }
+        : undefined),
+  };
+}
+
 export function extractAaHostsFromHtml(html: string): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
