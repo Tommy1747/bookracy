@@ -549,6 +549,17 @@ export function libgenSearchUrl(base: string, query: string): string {
  * and give up, turning a transient upstream wobble into a hard "No results found".
  * Observed repeatedly on .la/.li while diagnosing this on 2026-08-24.
  */
+/**
+ * True if the returned HTML is an AA anti-bot interstitial (a JS fingerprint challenge
+ * on .li that sets `redirect_link`, or a "Redirecting..." shim on .pm) rather than the
+ * real search results or /md5/ page.
+ */
+export function isAaChallengePage(html: string): boolean {
+  if (html.length < 2048 && /<title>\s*Redirecting/i.test(html)) return true;
+  if (/var\s+redirect_link\s*=/.test(html) || /iife\.min\.js/.test(html)) return true;
+  return false;
+}
+
 export function isLibgenErrorPage(html: string): boolean {
   return /Could not connect to the database|Too many connections/i.test(html) || isNginxPlaceholder(html);
 }
