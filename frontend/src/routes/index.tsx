@@ -17,6 +17,7 @@ import { SearchWithSuggestions } from "@/components/books/search-suggestions";
 import { useViewStore } from "@/stores/view";
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { trendingQueryOptions } from "@/api/backend/trending/trending";
+import { SearchStatusBanner } from "@/components/search/search-status-banner";
 
 export const Route = createFileRoute("/")({
   component: Index,
@@ -92,6 +93,7 @@ function Index() {
     isFetchingNextPage,
     hasNextPage,
     fetchNextPage,
+    refetch: refetchSearch,
   } = useInfiniteBooksQuery({
     query: debouncedQ,
     lang: filterToParam(language) ?? "",
@@ -102,6 +104,13 @@ function Index() {
 
   // Dedupe by md5 across upstream pages: the backend only dedupes within a page, and
   // a repeat on page 2 would otherwise render twice (and warn about duplicate keys).
+  const firstPage = infiniteData?.pages[0];
+  const isDegraded = Boolean(firstPage?.degraded);
+  const isPartial = Boolean(firstPage?.partial);
+  const isOutage = Boolean(firstPage?.outage);
+  const resultSource = firstPage?.source;
+  const degradationNotice = firstPage?.upstreamNotice?.message || firstPage?.message;
+
   const allResults = useMemo(() => {
     const seen = new Set<string>();
     return (infiniteData?.pages.flatMap((p) => p.results) ?? []).filter((b) => !seen.has(b.md5) && Boolean(seen.add(b.md5)));
@@ -220,9 +229,24 @@ function Index() {
                 {Array.from({ length: perPage }).map((_, i) => (view === "grid" ? <SkeletonBookItemGrid key={i} /> : <SkeletonBookItem key={i} />))}
               </div>
             )}
+
+            {!isSearching && (isDegraded || isOutage || isPartial) && (
+              <SearchStatusBanner
+                source={resultSource}
+                outage={isOutage}
+                partial={isPartial}
+                message={degradationNotice}
+                hasResults={allResults.length > 0}
+                onRetry={() => refetchSearch()}
+                isRetrying={isSearchFetching}
+              />
+            )}
+
             {searchError && <p className="text-destructive text-sm">Something went wrong: {searchErrorMessage}</p>}
 
-            {!isSearching && !searchError && allResults.length === 0 && <p className="text-muted-foreground py-8 text-center">No results for “{debouncedQ}”. Try a different title or author.</p>}
+            {!isSearching && !searchError && !isOutage && allResults.length === 0 && (
+              <p className="text-muted-foreground py-8 text-center">No results for “{debouncedQ}”. Try a different title or author.</p>
+            )}
 
             {!isSearching && pageResults.length > 0 && bulkDownloadEnabled && bulkActive && (
               <div className="flex flex-wrap items-center justify-between gap-2">

@@ -1,4 +1,4 @@
-import { parseSearchHtml, parseLibgenSearch, libgenSearchUrl, isLibgenErrorPage, locatorTitle, libgenCoverPath, type LibgenCoverFields, parseLibgenFilePage, parseCoverUrl, parseLibgenUrl, parseLibraryLolUrl, parseIpfsCids, pickGutenbergFormat, gutenbergMatches, gutenbergSupportsExt, pickInternetArchiveFile, internetArchiveMatches, internetArchiveSupportsExt, titleAuthorMatch, rankBooks, parseGreatestBooks, parseTgbNext, parseReadingOrderMaster, parseReadingOrderIssues, parseFiveBooksList, parseFiveBooksInterview, parseStandardEbooksFeed, pickStandardEbooksFormat, standardEbooksSupportsExt, standardEbooksMatches, parseAaSlowDownloadPage, FB_BASE, type RawBook, type GreatestBook, type ReadingOrderEra } from "./parse";
+import { parseSearchHtml, parseLibgenSearch, libgenSearchUrl, isAaChallengePage, isLibgenErrorPage, locatorTitle, libgenCoverPath, type LibgenCoverFields, parseLibgenFilePage, parseCoverUrl, parseLibgenUrl, parseLibraryLolUrl, parseIpfsCids, pickGutenbergFormat, gutenbergMatches, gutenbergSupportsExt, pickInternetArchiveFile, internetArchiveMatches, internetArchiveSupportsExt, titleAuthorMatch, rankBooks, parseGreatestBooks, parseTgbNext, parseReadingOrderMaster, parseReadingOrderIssues, parseFiveBooksList, parseFiveBooksInterview, parseStandardEbooksFeed, pickStandardEbooksFormat, standardEbooksSupportsExt, standardEbooksMatches, parseAaSlowDownloadPage, FB_BASE, type RawBook, type GreatestBook, type ReadingOrderEra } from "./parse";
 import {
   getAlias,
   setAlias,
@@ -14,6 +14,11 @@ import {
   BACKGROUND_PROBE_STRIKES,
   acquireLock,
   fetchableAaMirrors,
+  classifyProviderStatus,
+  type ProviderRunMetrics,
+  buildSearchResponsePayload,
+  type SearchNotice,
+  type SearchResponsePayload,
 } from "./reliability";
 import { inCompletionOrder } from "./concurrency";
 import { resumableBody } from "./resumable";
@@ -826,6 +831,15 @@ interface SearchOptions {
   raceLibgen?: boolean;
 }
 
+export interface SearchResultOutcome {
+  results: RawBook[];
+  source: "live" | "cache" | "fts" | "public_domain" | "none";
+  degraded: boolean;
+  partial?: boolean;
+  upstreamOutage: boolean;
+  upstreamNotice?: SearchNotice;
+}
+
 // How many libgen hosts an interactive search asks in parallel. Every mirror fronts the
 // SAME database, so the first readable page is the answer and the rest are cancelled.
 // From the edge the two fastest hosts answer in 1.5-2.6s but any one of them can take
@@ -841,18 +855,43 @@ const notTakenDown = (b: RawBook) => !takedown.isTakenDown(b.md5, b.title, b.aut
 
 // Filtered on the way out as well as on the way in: the edge cache and search_index can
 // still hold rows written before a takedown.
-async function search(query: string, page: number, filters: SearchFilters, ctx?: ExecutionContext, env?: Env, opts: SearchOptions = {}): Promise<RawBook[]> {
-  return (await searchSources(query, page, filters, ctx, env, opts)).filter(notTakenDown);
+async function search(
+  query: string,
+  page: number,
+  filters: SearchFilters,
+  ctx?: ExecutionContext,
+  env?: Env,
+  opts: SearchOptions = {},
+): Promise<SearchResultOutcome> {
+  const outcome = await searchSources(query, page, filters, ctx, env, opts);
+  return {
+    ...outcome,
+    results: outcome.results.filter(notTakenDown),
+  };
 }
 
-async function searchSources(query: string, page: number, filters: SearchFilters, ctx?: ExecutionContext, env?: Env, opts: SearchOptions = {}): Promise<RawBook[]> {
+async function searchSources(
+  query: string,
+  page: number,
+  filters: SearchFilters,
+  ctx?: ExecutionContext,
+  env?: Env,
+  opts: SearchOptions = {},
+): Promise<SearchResultOutcome> {
   query = normalizeQuery(query);
   const path = searchPath(query, page, filters);
 
   // Scraping + parsing an AA results page is the Worker's single most expensive
   // operation, so serve a repeat of the same query from the edge instead.
   const cached = await getCachedSearch<RawBook>(path);
-  if (cached) return cached;
+  if (cached) {
+    return {
+      results: cached,
+      source: "cache",
+      degraded: false,
+      upstreamOutage: false,
+    };
+  }
 
   const store = (fetched: RawBook[]): RawBook[] => {
     const results = fetched.filter(notTakenDown);
@@ -870,128 +909,206 @@ async function searchSources(query: string, page: number, filters: SearchFilters
     return results;
   };
 
-  for (const base of await getAaMirrors(ctx)) {
-    if (await isMirrorDown(base)) continue; // circuit-broken, skip this pass
-    if (await deferProbe(base, base + path, ctx)) continue; // long dead — probe it off-request
+  const aaMirrors = await getAaMirrors(ctx);
+  const aaMetrics: ProviderRunMetrics = {
+    total: aaMirrors.length,
+    skipped: 0,
+    attempted: 0,
+    healthyResponses: 0,
+    challenges: 0,
+    failures: 0,
+  };
+
+  for (const base of aaMirrors) {
+    if (await isMirrorDown(base)) {
+      aaMetrics.skipped++;
+      continue;
+    }
+    if (await deferProbe(base, base + path, ctx)) {
+      aaMetrics.skipped++;
+      continue;
+    }
+    aaMetrics.attempted++;
     const html = await fetchTextTimed(base + path, UPSTREAM_SEARCH_TIMEOUT_MS);
     if (!html) {
-      // Timed out, refused, or non-2xx — all mean "don't send the next user here".
+      aaMetrics.failures++;
       await markMirrorDown(base);
       continue;
     }
-    // An anti-bot interstitial is a 200 full of HTML that parses to zero results, so
-    // without this check it looks exactly like "this mirror has no matches" and we'd
-    // stop trusting a host that's actually fine. Skip it without blaming the mirror.
-    if (isAaChallengePage(html)) continue;
-    await markMirrorUp(base); // answered a real page — clear any accumulated backoff
+    if (isAaChallengePage(html)) {
+      aaMetrics.challenges++;
+      continue;
+    }
+    await markMirrorUp(base);
+    aaMetrics.healthyResponses++;
 
     const results = parseSearchHtml(html);
-    if (results.length) return store(results);
-    // Empty but readable: keep trying the other mirrors. AA's full-text search almost
-    // never returns nothing for a real query, so an empty page more likely means this
-    // host's index is degraded than that the book doesn't exist.
+    if (results.length) {
+      return {
+        results: store(results),
+        source: "live",
+        degraded: false,
+        upstreamOutage: false,
+      };
+    }
   }
 
   // Every AA mirror failed/returned nothing → fall back to a direct Library Genesis
   // search. Its md5s resolve on the exact same download path, so results stay usable.
-  // Filters/pagination differ upstream, so this only backstops the first page — enough
-  // to keep search alive during an AA outage without pretending to honour facets.
-  // Circuit-broken like the AA loop above. This used to walk every mirror unconditionally,
-  // which was survivable while it was a rare backstop — but with AA unreachable it runs on
-  // *every* uncached search, and a query with no matches walks the whole list. At an 8s
-  // timeout per host that's a ~48s worst case, and libgen.bz/.li were both measured at
-  // 16-20s during this outage. Skipping hosts we already know are timing out is the
-  // difference between a slow search and an abandoned one.
-  // A bare md5 is a *resolution*, not a search, and libgen's search index can't answer
-  // it — `index.php?req=<md5>` returns the empty search form with a 200, which looks
-  // exactly like "no matches". `file.php?md5=` resolves it directly off the same data
-  // the download path uses, so anything downloadable is now also resolvable. This is
-  // what keeps bookmarks, continue-reading and share links working without AA.
   if (page <= 1 && MD5_QUERY.test(query)) {
-    // Local index first, and deliberately so. A bookmarked md5 is by definition one the
-    // user already found through a search, so this is the *likely* case, not the
-    // fallback — and it turns a ~2s libgen fetch into a ~10ms primary-key read. It also
-    // removes most of the upstream amplification MD5_LIMITER exists to bound: a
-    // 120-book shelf stops firing 120 real libgen requests every time its cache lapses.
-    // Metadata can go stale (a title corrected upstream); for resolving a bookmark to a
-    // download that is a trade worth making.
-    if (env) {
-      const known = await searchIndex.findByMd5(env, query);
-      if (known) return [known];
-    }
+    const lgMd5Metrics: ProviderRunMetrics = {
+      total: LIBGEN_MIRRORS.length,
+      skipped: 0,
+      attempted: 0,
+      healthyResponses: 0,
+      challenges: 0,
+      failures: 0,
+    };
 
-    // Same shared-database reasoning as the search fallback below: two mirrors agreeing
-    // that they've never seen this md5 is as informative as six saying it, and an
-    // unknown md5 (a bookmark whose book was pulled upstream) is common enough on a big
-    // shelf that walking the full list on every one is real latency for no information.
     let cleanMisses = 0;
     for (const base of LIBGEN_MIRRORS) {
       if (cleanMisses >= 2) break;
-      if (await isMirrorDown(base)) continue;
-      if (await deferProbe(base, `${base}/file.php?md5=${query}`, ctx)) continue;
+      if (await isMirrorDown(base)) {
+        lgMd5Metrics.skipped++;
+        continue;
+      }
+      if (await deferProbe(base, `${base}/file.php?md5=${query}`, ctx)) {
+        lgMd5Metrics.skipped++;
+        continue;
+      }
+      lgMd5Metrics.attempted++;
       const html = await fetchTextTimed(`${base}/file.php?md5=${query}`, UPSTREAM_SEARCH_TIMEOUT_MS);
       const book = html ? parseLibgenFilePage(html, query) : null;
       if (book) {
         await markMirrorUp(base);
-        return store([book]);
+        lgMd5Metrics.healthyResponses++;
+        const classification = classifyProviderStatus(aaMetrics, lgMd5Metrics);
+        return {
+          results: store([book]),
+          source: "live",
+          degraded: classification.partialFailure,
+          partial: classification.partialFailure,
+          upstreamOutage: false,
+          upstreamNotice: classification.partialFailure
+            ? {
+                code: "UPSTREAM_DEGRADED",
+                message: "Some external search mirrors are experiencing delays.",
+              }
+            : undefined,
+        };
       }
 
-      // file.php didn't yield a book. Two different reasons land here, and json.php is
-      // worth asking for both:
-      //
-      //  - It timed out. `file.php` is a ~315 KB page and the budget is 8s, so a mirror
-      //    under load blows it: measured 2.2s from a laptop and >8s from the Worker on
-      //    the same md5, which is why a book libgen definitely holds was 404ing. json.php
-      //    returns the same record in ~1 KB, so it still completes on a link that slow.
-      //  - It parsed to nothing. Usually a genuine "no such md5", but it is also what an
-      //    unparseable title looks like: parseLibgenFilePage decodes a hand-written
-      //    grammar out of the <title> tag and returns null rather than guess ("better no
-      //    book than a wrong one"), silently dropping the book off the shelf.
-      //
-      // Both cost two small requests on a path that was otherwise about to give up.
       const viaJson = await resolveViaLibgenJson(base, query);
       if (viaJson) {
         await markMirrorUp(base);
-        return store([viaJson]);
+        lgMd5Metrics.healthyResponses++;
+        const classification = classifyProviderStatus(aaMetrics, lgMd5Metrics);
+        return {
+          results: store([viaJson]),
+          source: "live",
+          degraded: classification.partialFailure,
+          partial: classification.partialFailure,
+          upstreamOutage: false,
+          upstreamNotice: classification.partialFailure
+            ? {
+                code: "UPSTREAM_DEGRADED",
+                message: "Some external search mirrors are experiencing delays.",
+              }
+            : undefined,
+        };
       }
 
       if (!html) {
-        await markMirrorDown(base); // never answered at all — stop sending users here
+        lgMd5Metrics.failures++;
+        await markMirrorDown(base);
         continue;
       }
+
+      if (isLibgenErrorPage(html)) {
+        lgMd5Metrics.failures++;
+        await markMirrorDown(base);
+        continue;
+      }
+
       await markMirrorUp(base);
-      // Answered, but has no record for this md5.
+      lgMd5Metrics.healthyResponses++;
       cleanMisses++;
     }
-    return [];
+
+    const classification = classifyProviderStatus(aaMetrics, lgMd5Metrics);
+
+    // If live lookup missed/failed, try local index before declaring an outage
+    if (env) {
+      const known = await searchIndex.findByMd5(env, query);
+      if (known) {
+        const isDegraded = classification.upstreamOutage || classification.partialFailure;
+        return {
+          results: [known],
+          source: "fts",
+          degraded: isDegraded,
+          partial: classification.partialFailure,
+          upstreamOutage: classification.upstreamOutage,
+          upstreamNotice: classification.upstreamOutage
+            ? {
+                code: "UPSTREAM_DOWN",
+                message: "External search providers are temporarily unreachable. Showing saved library record.",
+              }
+            : classification.partialFailure
+              ? {
+                  code: "UPSTREAM_DEGRADED",
+                  message: "Some external search mirrors are experiencing delays. Showing saved library record.",
+                }
+              : undefined,
+        };
+      }
+    }
+
+    return {
+      results: [],
+      source: "none",
+      degraded: classification.upstreamOutage || classification.partialFailure,
+      partial: classification.partialFailure,
+      upstreamOutage: classification.upstreamOutage,
+      upstreamNotice: classification.upstreamOutage
+        ? {
+            code: "UPSTREAM_DOWN",
+            message: "External book search mirrors are temporarily unreachable.",
+          }
+        : classification.partialFailure
+          ? {
+              code: "UPSTREAM_DEGRADED",
+              message: "Some external search mirrors are experiencing delays.",
+            }
+          : undefined,
+    };
   }
 
+  const lgMetrics: ProviderRunMetrics = {
+    total: LIBGEN_MIRRORS.length,
+    skipped: 0,
+    attempted: 0,
+    healthyResponses: 0,
+    challenges: 0,
+    failures: 0,
+  };
+
   if (page <= 1) {
-    // The libgen mirrors are frontends onto the SAME database, so a healthy one that
-    // returns no matches is answering for all of them. Measured 2026-08-14 across
-    // .la/.bz/.gl/.li/.vg: identical result counts on every query tried. Walking the
-    // rest after the first clean miss just re-asks the same index and cost a ~9s median
-    // on queries with no matches. Two agreeing misses is enough — the second only
-    // guards against a mirror serving a degraded or partial index.
-    //
-    // NOTE: the 2026-08-14 run read "berserk"/"watchmen"/"attack on titan" as 0 results
-    // everywhere and concluded libgen has no comics (HANDOFF §9.15). That was OUR bug,
-    // not libgen's index — `parseLibgenSearch` was dropping every comic row (see the
-    // md5 gate in parse.ts). The mirrors-agree reasoning above survives; the "libgen
-    // has no manga" claim does not. Comics return ~25 rows per query as of 2026-08-20.
-    let cleanMisses = 0;
     const candidates: string[] = [];
     for (const base of LIBGEN_MIRRORS) {
-      if (await isMirrorDown(base)) continue;
-      if (await deferProbe(base, libgenSearchUrl(base, query), ctx)) continue;
+      if (await isMirrorDown(base)) {
+        lgMetrics.skipped++;
+        continue;
+      }
+      if (await deferProbe(base, libgenSearchUrl(base, query), ctx)) {
+        lgMetrics.skipped++;
+        continue;
+      }
       candidates.push(base);
     }
-    // Walk the healthy hosts in waves of `width`: one at a time on the chart path,
-    // two at a time for a person waiting on a search box. Within a wave the answers
-    // are handled in the order they land, and the first real result set cancels the
-    // rest of the wave.
+
+    let lgCleanMisses = 0;
     const width = opts.raceLibgen ? LIBGEN_SEARCH_RACE_WIDTH : 1;
-    for (let i = 0; i < candidates.length && cleanMisses < 2; i += width) {
+    for (let i = 0; i < candidates.length && lgCleanMisses < 2; i += width) {
       const wave = candidates.slice(i, i + width);
       const losers = new AbortController();
       const attempts = wave.map(async (base) => ({
@@ -999,58 +1116,157 @@ async function searchSources(query: string, page: number, filters: SearchFilters
         html: await fetchTextTimed(libgenSearchUrl(base, query), UPSTREAM_SEARCH_TIMEOUT_MS, HEADERS, losers.signal),
       }));
       for await (const { base, html } of inCompletionOrder(attempts)) {
+        lgMetrics.attempted++;
         if (!html) {
-          // A host we cancelled ourselves did nothing wrong; only a genuine failure
-          // (timeout, refused, non-2xx) earns a strike.
-          if (!losers.signal.aborted) await markMirrorDown(base);
+          if (!losers.signal.aborted) {
+            lgMetrics.failures++;
+            await markMirrorDown(base);
+          }
           continue;
         }
-        // A 200 carrying the search daemon's own error is not an answer about this book.
-        // Treat it like any other failed host: back it off and ask the next one, WITHOUT
-        // spending a clean miss — otherwise two overloaded mirrors end the search and we
-        // report "no results" for a book libgen has.
         if (isLibgenErrorPage(html)) {
+          lgMetrics.failures++;
           await markMirrorDown(base);
           continue;
         }
         await markMirrorUp(base);
-        // A readable page with no matches means this mirror is healthy and simply doesn't
-        // have the book — never a reason to mark it down, or one obscure query would
-        // blind us to the whole pool.
+        lgMetrics.healthyResponses++;
         const results = parseLibgenSearch(html);
         if (results.length) {
           losers.abort();
-          return store(results);
+          const classification = classifyProviderStatus(aaMetrics, lgMetrics);
+          return {
+            results: store(results),
+            source: "live",
+            degraded: classification.partialFailure,
+            partial: classification.partialFailure,
+            upstreamOutage: false,
+            upstreamNotice: classification.partialFailure
+              ? {
+                  code: "UPSTREAM_DEGRADED",
+                  message: "Some external search mirrors are experiencing delays.",
+                }
+              : undefined,
+          };
         }
-        cleanMisses++;
-        if (cleanMisses >= 2) {
+        lgCleanMisses++;
+        if (lgCleanMisses >= 2) {
           losers.abort();
           break;
         }
       }
     }
 
-    // Nothing from AA, nothing from libgen. Ask our own index before the public-domain
-    // sources: it holds real upstream md5s, so its hits download through the ordinary
-    // exact-md5 path and cover copyrighted works that Gutenberg/IA never will. Not
-    // stored again — these rows came from here.
+    const classification = classifyProviderStatus(aaMetrics, lgMetrics);
+
+    // Ask our own index before public-domain sources.
+    // CACHE SAFETY INVARIANT: FTS5 fallback results are NOT written to the 30-minute
+    // edge cache. Doing so would poison future queries with sparse offline results
+    // even after upstream mirrors recover.
     if (env) {
       const remembered = await searchIndex.findByQuery(env, query, PD_SOURCE_LIMIT * 4);
       if (remembered.length) {
-        const write = setCachedSearch(path, remembered).catch(() => {});
-        if (ctx) ctx.waitUntil(write);
-        return remembered;
+        const isDegraded = classification.upstreamOutage || classification.partialFailure;
+        return {
+          results: remembered,
+          source: "fts",
+          degraded: isDegraded,
+          partial: classification.partialFailure,
+          upstreamOutage: classification.upstreamOutage,
+          upstreamNotice: classification.upstreamOutage
+            ? {
+                code: "UPSTREAM_DOWN",
+                message: "External search providers are temporarily unreachable. Showing saved library index.",
+              }
+            : classification.partialFailure
+              ? {
+                  code: "UPSTREAM_DEGRADED",
+                  message: "Some external search mirrors are experiencing delays. Showing saved library index.",
+                }
+              : undefined,
+        };
       }
     }
 
-    // Still nothing, and nothing remembered. Before answering 404, ask the public-domain
-    // sources — they're independent of both, so they still answer when both are down.
-    // Only reached on a genuine dead end, so on a normal day this costs nothing.
+    // Public domain fallback.
+    // CACHE SAFETY: Do not cache degraded public-domain results as ordinary healthy search results.
     const pd = await searchPublicDomain(query);
-    if (pd.length) return store(pd);
+    if (pd.length) {
+      const isDegraded = classification.upstreamOutage || classification.partialFailure;
+      return {
+        results: pd,
+        source: "public_domain",
+        degraded: isDegraded,
+        partial: classification.partialFailure,
+        upstreamOutage: classification.upstreamOutage,
+        upstreamNotice: classification.upstreamOutage
+          ? {
+              code: "UPSTREAM_DOWN",
+              message: "External search providers are temporarily unreachable. Showing public-domain catalog results.",
+            }
+          : classification.partialFailure
+            ? {
+                code: "UPSTREAM_DEGRADED",
+                message: "Some external search mirrors are experiencing delays. Showing public-domain catalog results.",
+              }
+            : undefined,
+      };
+    }
+
+    // Both live providers, FTS5, and PD returned nothing.
+    // If upstream genuinely answered with clean misses, this is a legitimate empty search (not an outage).
+    // If upstream failed/errored without clean misses, it is an outage.
+    if (classification.upstreamOutage) {
+      return {
+        results: [],
+        source: "none",
+        degraded: true,
+        partial: false,
+        upstreamOutage: true,
+        upstreamNotice: {
+          code: "UPSTREAM_DOWN",
+          message: "External search providers are temporarily unreachable. No saved matches found.",
+        },
+      };
+    }
+
+    return {
+      results: [],
+      source: "live",
+      degraded: classification.partialFailure,
+      partial: classification.partialFailure,
+      upstreamOutage: false,
+      upstreamNotice: classification.partialFailure
+        ? {
+            code: "UPSTREAM_DEGRADED",
+            message: "Some external search mirrors experienced delays.",
+          }
+        : undefined,
+    };
   }
 
-  return [];
+  // page > 1: AA was the only source that supported pagination.
+  const aaClassification = classifyProviderStatus(aaMetrics, {
+    total: 0,
+    skipped: 0,
+    attempted: 0,
+    healthyResponses: 0,
+    challenges: 0,
+    failures: 0,
+  });
+  return {
+    results: [],
+    source: "none",
+    degraded: aaClassification.aaUnavailable,
+    partial: false,
+    upstreamOutage: aaClassification.aaUnavailable,
+    upstreamNotice: aaClassification.aaUnavailable
+      ? {
+          code: "UPSTREAM_DOWN",
+          message: "External search provider is temporarily unreachable.",
+        }
+      : undefined,
+  };
 }
 
 // ---- Facets, applied locally ----------------------------------------------------
@@ -1167,15 +1383,17 @@ async function handleSearch(url: URL, origin: string, env: Env, ctx: ExecutionCo
         })
       : null;
 
-  let results: RawBook[];
+  let searchOutcome: SearchResultOutcome;
   try {
-    results = await search(query, page, filters, ctx, env, { raceLibgen: true });
+    searchOutcome = await search(query, page, filters, ctx, env, { raceLibgen: true });
   } catch (e) {
     console.error("search failed", e);
     // Don't leave the in-flight D1 promise unhandled when we bail out early.
     void communityLookup;
     return asText ? plain("ERR\tsearch failed\n", 502) : json({ error: "Search failed" }, 502);
   }
+
+  let results = searchOutcome.results;
 
   // Relevance re-rank (default order only): AA/libgen return loose full-text matches,
   // so promote the closest title/issue-number matches (fixes e.g. a comic "#1" query
@@ -1200,11 +1418,13 @@ async function handleSearch(url: URL, origin: string, env: Env, ctx: ExecutionCo
   // with community:true so the frontend can mark them "User upload").
   const matches = (communityLookup ? await communityLookup : []).filter((c) => !takedown.isTakenDown(c.md5, c.title, c.author));
   const communityItems = matches.map((c) => ({ ...communityToBookItem(c, origin), community: true }));
-  const seen = new Set(communityItems.map((c) => c.md5));
-  const merged = [...communityItems, ...results.filter((r) => !seen.has(r.md5)).map((r) => toBookItem(r, origin))];
+  const upstreamItems = results.map((r) => toBookItem(r, origin));
 
-  if (!merged.length) return json({ message: "No results found" }, 404);
-  return json({ results: merged });
+  const payload = buildSearchResponsePayload(searchOutcome, communityItems, upstreamItems);
+  if (!payload.results.length && !payload.outage) {
+    return json({ message: "No results found" }, 404);
+  }
+  return json(payload, 200);
 }
 
 // Titles to put on the homepage shelf, newest bestsellers first. Live from the Apple
@@ -1236,7 +1456,8 @@ async function resolveChart(entries: { title: string; author: string }[], origin
       const index = cursor++;
       const { title, author } = entries[index];
       const query = author ? `${title} ${author}` : title;
-      const hits = await search(query, 1, NO_FILTERS, ctx, env).catch(() => [] as RawBook[]);
+      const searchRes = await search(query, 1, NO_FILTERS, ctx, env).catch(() => null);
+      const hits = searchRes?.results || [];
       if (!hits.length) continue;
       const ranked = rankBooks(query, hits);
       resolved[index] = author ? ranked.find((r) => titleAuthorMatch(title, author, r.title, r.author)) : ranked[0];
@@ -2299,16 +2520,6 @@ async function fetchFromLibraryLol(md5: string): Promise<Response | null> {
   return null;
 }
 
-// True if the returned HTML is an AA anti-bot interstitial (a JS fingerprint challenge
-// on .li that sets `redirect_link`, or a "Redirecting..." shim on .pm) rather than the
-// real /md5/ page. These pages return 200 text/html but contain zero of the data we need,
-// so parseIpfsCids / parseCoverUrl would silently find nothing. Reject them so the mirror
-// loop moves on to one that answers with the actual page.
-function isAaChallengePage(html: string): boolean {
-  if (html.length < 2048 && /<title>\s*Redirecting/i.test(html)) return true;
-  if (/var\s+redirect_link\s*=/.test(html) || /iife\.min\.js/.test(html)) return true;
-  return false;
-}
 
 // The Anna's Archive /md5 page HTML (raced across mirrors) — the CID source for IPFS
 // AND the slow_download partner list. Circuit-breaker aware.
